@@ -36,13 +36,27 @@ cd "$OBSIDIAN_GIT_DIR"
 pnpm install --frozen-lockfile
 
 # --- Additional repo: influx (npm), declared via repositoryDependencies ---
-INFLUX_DIR="${INFLUX_DIR:-$WORKSPACE_ROOT/influx}"
-if [ -f "$INFLUX_DIR/package.json" ]; then
+# Cursor clones repositoryDependencies alongside the primary repo; the exact
+# root can vary by checkout layout, so search a few likely locations.
+INFLUX_DIR=""
+for candidate in \
+    "${INFLUX_DIR_OVERRIDE:-}" \
+    "$WORKSPACE_ROOT/influx" \
+    "$OBSIDIAN_GIT_DIR/../influx" \
+    "/workspace/influx" \
+    "$HOME/influx"; do
+    if [ -n "$candidate" ] && [ -f "$candidate/package.json" ]; then
+        INFLUX_DIR="$(cd "$candidate" && pwd)"
+        break
+    fi
+done
+
+if [ -n "$INFLUX_DIR" ]; then
     echo "Installing influx dependencies (npm) at $INFLUX_DIR..."
     cd "$INFLUX_DIR"
     npm ci
 else
-    echo "influx not found at $INFLUX_DIR; skipping (repositoryDependencies not checked out)."
+    echo "influx not found near the workspace; skipping (repositoryDependencies not checked out yet)."
 fi
 
 echo "Cloud Agent install complete."
