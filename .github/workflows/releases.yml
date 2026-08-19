@@ -70,10 +70,10 @@ jobs:
                   set -euo pipefail
 
                   if [ -n "${INPUT_VERSION}" ]; then
-                      pnpm run release -- --release-as "${INPUT_VERSION}"
+                      pnpm exec standard-version --release-as "${INPUT_VERSION}"
                       did_bump=true
                   elif [ "${INPUT_BUMP}" != "none" ]; then
-                      pnpm run release -- --release-as "${INPUT_BUMP}"
+                      pnpm exec standard-version --release-as "${INPUT_BUMP}"
                       did_bump=true
                   else
                       did_bump=false
@@ -89,30 +89,39 @@ jobs:
                   echo "version=${version}" >> "${GITHUB_OUTPUT}"
                   echo "did_bump=${did_bump}" >> "${GITHUB_OUTPUT}"
 
+            - name: Extract changelog
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: node scripts/extract-changelog.ts "${VERSION}" > release-notes.md
+
             - name: Guard existing tag and release
+              id: guard
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   VERSION: ${{ steps.version.outputs.version }}
               run: |
                   set -euo pipefail
 
-                  if git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q .; then
-                      echo "Tag ${VERSION} already exists on origin."
-                      exit 1
-                  fi
-
                   if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
                       echo "GitHub Release ${VERSION} already exists."
                       exit 1
                   fi
 
+                  if git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q .; then
+                      echo "Tag ${VERSION} already exists on origin. Finishing the GitHub Release."
+                      echo "resume=true" >> "${GITHUB_OUTPUT}"
+                  else
+                      echo "resume=false" >> "${GITHUB_OUTPUT}"
+                  fi
+
             - name: Create tag
-              if: steps.version.outputs.did_bump != 'true'
+              if: steps.version.outputs.did_bump != 'true' && steps.guard.outputs.resume != 'true'
               env:
                   VERSION: ${{ steps.version.outputs.version }}
               run: git tag "${VERSION}"
 
             - name: Push commit and tag
+              if: steps.guard.outputs.resume != 'true'
               env:
                   VERSION: ${{ steps.version.outputs.version }}
                   DID_BUMP: ${{ steps.version.outputs.did_bump }}
@@ -132,11 +141,6 @@ jobs:
                   mkdir "${{ env.PLUGIN_NAME }}"
                   cp main.js manifest.json styles.css "${{ env.PLUGIN_NAME }}"
                   zip -r "${{ env.PLUGIN_NAME }}-${VERSION}.zip" "${{ env.PLUGIN_NAME }}"
-
-            - name: Extract changelog
-              env:
-                  VERSION: ${{ steps.version.outputs.version }}
-              run: node scripts/extract-changelog.ts "${VERSION}" > release-notes.md
 
             - name: Attest build provenance
               uses: actions/attest@v4
