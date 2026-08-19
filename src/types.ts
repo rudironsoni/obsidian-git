@@ -370,6 +370,12 @@ export class NoNetworkError extends Error {
     }
 }
 
+export class UserCanceledError extends Error {
+    constructor() {
+        super("The user canceled the operation");
+    }
+}
+
 declare module "obsidian" {
     interface App {
         openWithDefaultApp(path: string): void;
