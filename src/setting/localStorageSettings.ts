@@ -157,6 +157,55 @@ export class LocalStorageSettings {
     }
 
     /**
+     * Whether the app is currently in the foreground with this plugin
+     * loaded. Read on the next boot to detect crashes: a session that ended
+     * while still active was killed rather than closed.
+     */
+    getSessionActive(): boolean {
+        return (
+            this.app.loadLocalStorage(this.prefix + "sessionActive") == "true"
+        );
+    }
+
+    setSessionActive(value: boolean): void {
+        return this.app.saveLocalStorage(
+            this.prefix + "sessionActive",
+            `${value}`
+        );
+    }
+
+    /** Number of consecutive boots that ended in a foreground death. */
+    getStartupCrashCount(): number {
+        return Number(
+            this.app.loadLocalStorage(this.prefix + "startupCrashCount") ?? 0
+        );
+    }
+
+    setStartupCrashCount(value: number): void {
+        return this.app.saveLocalStorage(
+            this.prefix + "startupCrashCount",
+            String(value)
+        );
+    }
+
+    /**
+     * Whether automatic git startup is skipped because previous launches
+     * crashed (see `StartupGuard`).
+     */
+    getStartupSafeMode(): boolean {
+        return (
+            this.app.loadLocalStorage(this.prefix + "startupSafeMode") == "true"
+        );
+    }
+
+    setStartupSafeMode(value: boolean): void {
+        return this.app.saveLocalStorage(
+            this.prefix + "startupSafeMode",
+            `${value}`
+        );
+    }
+
+    /**
      * Whether automatic routines are currently paused.
      * New timers should not be started when this is true.
      */
