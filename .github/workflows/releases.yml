@@ -1,12 +1,28 @@
 name: Build obsidian plugin
 
 on:
-    push:
-        tags:
-            - "*"
+    workflow_dispatch:
+        inputs:
+            bump:
+                description: Version bump
+                type: choice
+                options:
+                    - none
+                    - patch
+                    - minor
+                    - major
+                default: none
+            version:
+                description: Explicit version (optional, overrides bump)
+                type: string
+                required: false
 
 env:
     PLUGIN_NAME: obsidian-git
+
+concurrency:
+    group: release
+    cancel-in-progress: false
 
 permissions:
     id-token: write
@@ -14,21 +30,114 @@ permissions:
     attestations: write
 
 jobs:
-    build:
+    release:
         runs-on: ubuntu-latest
         steps:
+            - name: Require master
+              if: github.ref != 'refs/heads/master'
+              run: |
+                  echo "Releases must be created from master (got ${{ github.ref }})."
+                  exit 1
+
             - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
+
             - uses: pnpm/action-setup@v6
               with:
                   version: latest
-            - name: Build
-              id: build
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Install
+              run: pnpm install
+
+            - name: Configure git
               run: |
-                  pnpm install
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            - name: Resolve version
+              id: version
+              env:
+                  INPUT_BUMP: ${{ inputs.bump }}
+                  INPUT_VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+
+                  if [ -n "${INPUT_VERSION}" ]; then
+                      pnpm run release -- --release-as "${INPUT_VERSION}"
+                      did_bump=true
+                  elif [ "${INPUT_BUMP}" != "none" ]; then
+                      pnpm run release -- --release-as "${INPUT_BUMP}"
+                      did_bump=true
+                  else
+                      did_bump=false
+                  fi
+
+                  version="$(node -p "require('./package.json').version")"
+                  manifest_version="$(node -p "require('./manifest.json').version")"
+                  if [ "${version}" != "${manifest_version}" ]; then
+                      echo "package.json (${version}) and manifest.json (${manifest_version}) versions do not match."
+                      exit 1
+                  fi
+
+                  echo "version=${version}" >> "${GITHUB_OUTPUT}"
+                  echo "did_bump=${did_bump}" >> "${GITHUB_OUTPUT}"
+
+            - name: Guard existing tag and release
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  set -euo pipefail
+
+                  if git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q .; then
+                      echo "Tag ${VERSION} already exists on origin."
+                      exit 1
+                  fi
+
+                  if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+                      echo "GitHub Release ${VERSION} already exists."
+                      exit 1
+                  fi
+
+            - name: Create tag
+              if: steps.version.outputs.did_bump != 'true'
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: git tag "${VERSION}"
+
+            - name: Push commit and tag
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+                  DID_BUMP: ${{ steps.version.outputs.did_bump }}
+              run: |
+                  set -euo pipefail
+                  if [ "${DID_BUMP}" = "true" ]; then
+                      git push origin HEAD:master
+                  fi
+                  git push origin "${VERSION}"
+
+            - name: Build
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  set -euo pipefail
                   pnpm run build --if-present
-                  mkdir ${{ env.PLUGIN_NAME }}
-                  cp main.js manifest.json styles.css ${{ env.PLUGIN_NAME }}
-                  zip -r ${{ env.PLUGIN_NAME }}-${{ github.ref_name }}.zip ${{ env.PLUGIN_NAME }}
+                  mkdir "${{ env.PLUGIN_NAME }}"
+                  cp main.js manifest.json styles.css "${{ env.PLUGIN_NAME }}"
+                  zip -r "${{ env.PLUGIN_NAME }}-${VERSION}.zip" "${{ env.PLUGIN_NAME }}"
+
+            - name: Extract changelog
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: node scripts/extract-changelog.ts "${VERSION}" > release-notes.md
+
             - name: Attest build provenance
               uses: actions/attest@v4
               with:
@@ -36,19 +145,20 @@ jobs:
                       main.js
                       manifest.json
                       styles.css
-                      ${{ env.PLUGIN_NAME }}-${{ github.ref_name }}.zip
+                      ${{ env.PLUGIN_NAME }}-${{ steps.version.outputs.version }}.zip
+
             - name: Create Release
-              id: create_release
               uses: softprops/action-gh-release@v3
               with:
-                  tag_name: ${{ github.ref }}
-                  name: ${{ github.ref_name }}
+                  tag_name: ${{ steps.version.outputs.version }}
+                  name: ${{ steps.version.outputs.version }}
                   generate_release_notes: false
-                  body: See the [changelog](https://github.com/Vinzent03/obsidian-git/blob/master/CHANGELOG.md) for details.
+                  body_path: release-notes.md
                   draft: false
                   prerelease: false
+                  fail_on_unmatched_files: true
                   files: |
                       main.js
                       manifest.json
                       styles.css
-                      ${{ env.PLUGIN_NAME }}-${{ github.ref_name }}.zip
+                      ${{ env.PLUGIN_NAME }}-${{ steps.version.outputs.version }}.zip
