@@ -222,8 +222,7 @@ export interface Blame {
  *    !                  !                  ignored
  *
  *
- * FileStatusResult is based off simple-git's FileStatusResult:
- * https://github.com/steveukx/git-js/blob/a569868d800a0d872e8fb1534bb0dceccff47a4f/typings/response.d.ts#L267
+ * FileStatusResult follows git status --short codes.
  */
 export interface FileStatusResult {
     path: string;
