@@ -1377,8 +1377,20 @@ export class WasmGit extends GitManager {
         relativeToVault = true
     ): Promise<string> {
         const repoPath = this.getRelativeRepoPath(file, relativeToVault);
-        const spec = `${commitHash}:${repoPath}`;
-        const result = await this.read(["cat-file", "-p", spec]);
+        // lg2's cat-file does not implement the `:path` index revision.
+        // Resolve the staged blob via `ls-files -s` when no commit is given.
+        if (commitHash === "") {
+            const indexed = await this.readIndexFile(repoPath);
+            if (indexed == undefined) {
+                throw new Error(`exists on disk, but not in '${repoPath}'`);
+            }
+            return indexed;
+        }
+        const result = await this.read([
+            "cat-file",
+            "-p",
+            `${commitHash}:${repoPath}`,
+        ]);
         return result.stdout;
     }
 
@@ -1411,10 +1423,7 @@ export class WasmGit extends GitManager {
             const original = originalExists
                 ? this.lg2.fs.readFile(memPath, { encoding: "utf8" })
                 : "";
-            const indexed = await this.read(["cat-file", "-p", `:${repoPath}`], {
-                ignoreErrors: true,
-            });
-            const source = indexed.stdout.length > 0 ? indexed.stdout : "";
+            const source = (await this.readIndexFile(repoPath)) ?? "";
             const patched = applyUnifiedPatch(source, patch);
             this.lg2.fs.writeFile(memPath, patched);
             await this.lg2.run(MEM_ROOT, ["add", repoPath]);
@@ -1508,6 +1517,19 @@ export class WasmGit extends GitManager {
             resetMemRepo(this.lg2);
         }
         return Promise.resolve();
+    }
+
+    /** Reads the staged blob for `repoPath`, or undefined if it is untracked. */
+    private async readIndexFile(repoPath: string): Promise<string | undefined> {
+        const listed = await this.read(["ls-files", "-s", "--", repoPath], {
+            ignoreErrors: true,
+        });
+        const hash = listed.stdout.match(/^[0-7]+ ([0-9a-f]{40}) /m)?.[1];
+        if (!hash) return undefined;
+        const result = await this.read(["cat-file", "-p", hash], {
+            ignoreErrors: true,
+        });
+        return result.stdout;
     }
 
     updateGitPath(_: string): Promise<void> {

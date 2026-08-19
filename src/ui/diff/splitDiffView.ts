@@ -182,11 +182,7 @@ export default class SplitDiffView extends ItemView {
 
     async gitShow(commitHash: string, file: string): Promise<string> {
         try {
-            return await this.plugin.gitManager.show(
-                commitHash,
-                file,
-                false
-            );
+            return await this.plugin.gitManager.show(commitHash, file, false);
         } catch (error) {
             if (error instanceof Error) {
                 if (

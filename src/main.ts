@@ -650,8 +650,7 @@ export default class ObsidianGit extends Plugin {
         if (url) {
             const confirmOption = "Vault Root";
             let dir = await new GeneralModal(this, {
-                options:
-                    [confirmOption],
+                options: [confirmOption],
                 placeholder:
                     "Enter directory for clone. It needs to be empty or not existent.",
                 allowEmpty: true,
