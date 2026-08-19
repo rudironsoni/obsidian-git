@@ -66,10 +66,10 @@ async function getData(
     | { result: "failure"; reason: string }
 > {
     const branchInfo = await manager.branchInfo();
-    let remoteBranch = branchInfo.tracking;
-    let branch = branchInfo.current;
+    const remoteBranch = branchInfo.tracking;
+    const branch = branchInfo.current;
     let remoteUrl: string | undefined = undefined;
-    let filePath = manager.getRelativeRepoPath(file.path);
+    const filePath = manager.getRelativeRepoPath(file.path);
 
     if (remoteBranch == null) {
         return {
