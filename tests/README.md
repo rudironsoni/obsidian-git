@@ -104,7 +104,7 @@ before the test finishes.
 
 ### wasm-git Helpers
 
-The mobile backend (`WasmGit`) is tested against a real filesystem and a real
+The `WasmGit` backend is tested against a real filesystem and a real
 local Git HTTP server:
 
 -   `tests/helpers/fsVaultAdapter.ts` implements the vault adapter surface used
@@ -126,7 +126,8 @@ loader applies.
 
 -   Prefer pure unit tests for pure logic.
 -   Prefer real temporary Git repositories for Git workflow behavior.
--   Avoid mocking `simple-git` for methods whose value is in the Git workflow.
+-   Use native `git` / `simple-git` only as a test fixture and oracle, not as
+    the plugin backend.
 -   Avoid launching Obsidian for the default test suite.
 -   Keep the Obsidian stub minimal and test-only.
 -   Keep helpers small and behavior-focused.

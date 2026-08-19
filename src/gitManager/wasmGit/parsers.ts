@@ -1,4 +1,4 @@
-import type { MergeStrategy } from "../../types";
+import type { Blame, BlameCommit, MergeStrategy } from "../../types";
 
 export interface ParsedStatus {
     /** Short name of the current branch, undefined when HEAD is unborn/detached. */
@@ -511,6 +511,142 @@ export function splitCommandLine(command: string): string[] {
         args.push(current);
     }
     return args;
+}
+
+/**
+ * Turns lg2's non-porcelain blame lines plus commit objects into the
+ * porcelain-shaped {@link Blame} used by line authoring.
+ */
+export function toPorcelainBlame(
+    lines: ParsedBlameLine[],
+    commits: Map<string, ParsedCommitObject>,
+    fullHashes: Map<string, string>
+): Blame {
+    const blameCommits = new Map<string, BlameCommit>();
+    const hashPerLine: string[] = [undefined as unknown as string];
+    const originalFileLineNrPerLine: number[] = [
+        undefined as unknown as number,
+    ];
+    const finalFileLineNrPerLine: number[] = [undefined as unknown as number];
+    const groupSizePerStartingLine = new Map<number, number>();
+
+    let previousHash: string | undefined;
+    let groupStart = 1;
+    let groupSize = 0;
+
+    for (const line of lines) {
+        const full = fullHashes.get(line.hash) ?? line.hash;
+        if (!blameCommits.has(full)) {
+            const object = commits.get(line.hash);
+            blameCommits.set(full, {
+                hash: full,
+                isZeroCommit: /^0+$/.test(full),
+                summary: object?.message.split("\n")[0] ?? "",
+                author: {
+                    name: object?.author.name ?? line.name,
+                    email: object?.author.email ?? line.email,
+                    epochSeconds: object?.author.epochSeconds ?? 0,
+                    tz: object?.author.tz ?? "+0000",
+                },
+                committer: object
+                    ? {
+                          name: object.committer.name,
+                          email: object.committer.email,
+                          epochSeconds: object.committer.epochSeconds,
+                          tz: object.committer.tz,
+                      }
+                    : undefined,
+            });
+        }
+        hashPerLine.push(full);
+        originalFileLineNrPerLine.push(line.line);
+        finalFileLineNrPerLine.push(line.line);
+        if (previousHash !== undefined && previousHash !== full) {
+            groupSizePerStartingLine.set(groupStart, groupSize);
+            groupStart = line.line;
+            groupSize = 0;
+        }
+        groupSize += 1;
+        previousHash = full;
+    }
+    if (previousHash !== undefined) {
+        groupSizePerStartingLine.set(groupStart, groupSize);
+    }
+    return {
+        commits: blameCommits,
+        hashPerLine,
+        originalFileLineNrPerLine,
+        finalFileLineNrPerLine,
+        groupSizePerStartingLine,
+    };
+}
+
+/** Extracts the `+++ b/<path>` target from a unified diff. */
+export function extractPatchPath(patch: string): string | undefined {
+    const match = patch.match(/^\+\+\+ b\/(.+)$/m);
+    return match?.[1];
+}
+
+/**
+ * Applies a unified diff to `source`. The hunks produced by
+ * {@link import("../../editor/signs/hunks").Hunks.createPatch} contain only
+ * added/removed lines (no context), which this handles by splicing at the
+ * 1-based old-file start.
+ */
+export function applyUnifiedPatch(source: string, patch: string): string {
+    const endsWithNewline = source.endsWith("\n");
+    const lines = source.split("\n");
+    if (endsWithNewline && lines[lines.length - 1] === "") {
+        lines.pop();
+    }
+
+    const patchLines = patch.split("\n");
+    let offset = 0;
+    let index = 0;
+    while (index < patchLines.length) {
+        const header = patchLines[index]!.match(
+            /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
+        );
+        if (!header) {
+            index += 1;
+            continue;
+        }
+        const oldStart = parseInt(header[1]!);
+        const oldCount = header[2] != undefined ? parseInt(header[2]) : 1;
+        index += 1;
+        const replacement: string[] = [];
+        while (index < patchLines.length) {
+            const line = patchLines[index]!;
+            if (line.startsWith("@@")) break;
+            if (
+                line.startsWith("diff ") ||
+                line.startsWith("index ") ||
+                line.startsWith("---") ||
+                line.startsWith("+++")
+            ) {
+                index += 1;
+                continue;
+            }
+            if (line.startsWith("+")) {
+                replacement.push(line.slice(1));
+                index += 1;
+                continue;
+            }
+            if (line.startsWith("-") || line.startsWith(" ")) {
+                index += 1;
+                continue;
+            }
+            if (line === "\\ No newline at end of file") {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+        const startIdx = Math.max(0, oldStart - 1 + offset);
+        lines.splice(startIdx, oldCount, ...replacement);
+        offset += replacement.length - oldCount;
+    }
+    return lines.join("\n") + (endsWithNewline ? "\n" : "");
 }
 
 function firstNonNull(...values: (string | undefined)[]): string | undefined {

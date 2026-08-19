@@ -1,6 +1,7 @@
 import { Notice, normalizePath } from "obsidian";
 import type ObsidianGit from "../../main";
 import type {
+    Blame,
     BranchInfo,
     DiffFile,
     FileStatusResult,
@@ -15,9 +16,11 @@ import { splitRemoteBranch } from "../../utils";
 import { GitManager } from "../gitManager";
 import { HttpStatusError, WasmGitHttpBridge } from "./httpBridge";
 import { Lg2 } from "./lg2";
-import type { ParsedBlameLine, ParsedCommitObject } from "./parsers";
+import type { ParsedCommitObject } from "./parsers";
 import {
+    applyUnifiedPatch,
     extractFileDiff,
+    extractPatchPath,
     parseBlame,
     parseCommitObject,
     parseForEachRef,
@@ -29,16 +32,10 @@ import {
     removeConfigKey,
     resolveConflictMarkers,
     splitCommandLine,
+    toPorcelainBlame,
 } from "./parsers";
 import type { MirrorAdapter } from "./vaultMirror";
 import { VaultMirror } from "./vaultMirror";
-
-/** Blame information for one file, built from lg2's blame and commit data. */
-export interface BlameInfo {
-    lines: ParsedBlameLine[];
-    /** Commit metadata per short hash appearing in `lines`. */
-    commits: Map<string, ParsedCommitObject>;
-}
 
 const MEM_ROOT = "/repo";
 const MEM_GITDIR = `${MEM_ROOT}/.git`;
@@ -46,15 +43,17 @@ const MEM_GITDIR = `${MEM_ROOT}/.git`;
 const PATH_BATCH_SIZE = 50;
 
 /**
- * Git backend for mobile (and any platform without a native git binary),
- * powered by wasm-git: libgit2 compiled to WebAssembly.
+ * Sole Git backend for desktop and mobile, powered by wasm-git (libgit2
+ * compiled to WebAssembly).
  *
  * The engine runs against an in-memory filesystem that is kept in sync with
  * the vault by {@link VaultMirror}: the working tree is re-synced from the
  * vault before every operation, and both the working tree and the `.git`
  * directory are persisted back to the vault after mutating operations.
+ * Commands are serialized through {@link Lg2}'s mutex on the plugin thread
+ * because Obsidian's adapter and `requestUrl` are main-thread APIs.
  * Remote access goes through {@link WasmGitHttpBridge} on top of Obsidian's
- * `requestUrl`, so it works on mobile without CORS restrictions.
+ * `requestUrl`, so HTTPS remotes work without CORS restrictions.
  */
 export class WasmGit extends GitManager {
     private readonly httpBridge = new WasmGitHttpBridge();
@@ -1308,18 +1307,158 @@ export class WasmGit extends GitManager {
             .map((ref) => ref.refName.substring("refs/tags/".length));
     }
 
-    /** Line-by-line blame for a file, enriched with commit metadata. */
-    async blame(filePath: string, relativeToVault = false): Promise<BlameInfo> {
-        const repoPath = this.getRelativeRepoPath(filePath, relativeToVault);
+    /**
+     * Line-by-line blame in the porcelain-shaped {@link Blame} format used
+     * by line authoring. Returns `"untracked"` when the path is not in the
+     * index. wasm-git's blame has no `-C`/`-w` flags, so movement tracking
+     * and whitespace ignoring are accepted for API compatibility only.
+     */
+    async blame(
+        filePath: string,
+        _trackMovement?: "inactive" | "same-commit" | "all-commits",
+        _ignoreWhitespace?: boolean
+    ): Promise<Blame | "untracked"> {
+        const repoPath = this.getRelativeRepoPath(filePath);
+        if (!(await this.isTracked(repoPath))) return "untracked";
         const result = await this.read(["blame", repoPath]);
         const lines = parseBlame(result.stdout);
         const commits = new Map<string, ParsedCommitObject>();
+        const fullHashes = new Map<string, string>();
         for (const line of lines) {
             if (commits.has(line.hash)) continue;
-            const commit = await this.catFileCommit(line.hash);
+            const full = (await this.revParse(line.hash)) ?? line.hash;
+            fullHashes.set(line.hash, full);
+            const commit = await this.catFileCommit(full);
             if (commit) commits.set(line.hash, commit);
         }
-        return { lines, commits };
+        return toPorcelainBlame(lines, commits, fullHashes);
+    }
+
+    async isTracked(path: string): Promise<boolean> {
+        const repoPath = this.getRelativeRepoPath(path);
+        const tracked = await this.lsFiles();
+        return tracked.includes(repoPath);
+    }
+
+    async hashObject(filepath: string): Promise<string> {
+        const repoPath = this.getRelativeRepoPath(filepath);
+        const hashed = await this.read(["hash-object", repoPath], {
+            ignoreErrors: true,
+        });
+        const hash = hashed.stdout.match(/^[0-9a-f]{40}$/m)?.[0];
+        if (hash) return hash;
+        const head = await this.revParse("HEAD");
+        return head ?? "";
+    }
+
+    async submoduleAwareHeadRevisonInContainingDirectory(
+        _filepath: string
+    ): Promise<string> {
+        return (await this.revParse("HEAD")) ?? "";
+    }
+
+    async getSubmodulePaths(): Promise<string[]> {
+        return Promise.resolve([]);
+    }
+
+    async getSubmoduleOfFile(
+        _repositoryRelativeFile: string
+    ): Promise<{ submodule: string; relativeFilepath: string } | undefined> {
+        return Promise.resolve(undefined);
+    }
+
+    async isFileTrackedByLFS(_filePath: string): Promise<boolean> {
+        return Promise.resolve(false);
+    }
+
+    async show(
+        commitHash: string,
+        file: string,
+        relativeToVault = true
+    ): Promise<string> {
+        const repoPath = this.getRelativeRepoPath(file, relativeToVault);
+        const spec = `${commitHash}:${repoPath}`;
+        const result = await this.read(["cat-file", "-p", spec]);
+        return result.stdout;
+    }
+
+    async diff(
+        file: string,
+        commit1: string,
+        commit2: string
+    ): Promise<string> {
+        const result = await this.read(["diff", "-p", commit1, commit2], {
+            ignoreErrors: true,
+        });
+        return extractFileDiff(result.stdout, file) ?? "";
+    }
+
+    /**
+     * Applies a unified diff to the index (`git apply --cached`).
+     * lg2 has no `apply` command, so the patch is applied in TypeScript to
+     * the current index blob, then staged via a worktree swap that restores
+     * the user's working-tree content afterwards.
+     */
+    async applyPatch(patch: string): Promise<void> {
+        const repoPath = extractPatchPath(patch);
+        if (repoPath == undefined) {
+            throw new Error("Patch is missing a +++ b/<path> header");
+        }
+        await this.syncIn();
+        try {
+            const memPath = `${MEM_ROOT}/${repoPath}`;
+            const originalExists = this.lg2.fs.analyzePath(memPath).exists;
+            const original = originalExists
+                ? this.lg2.fs.readFile(memPath, { encoding: "utf8" })
+                : "";
+            const indexed = await this.read(["cat-file", "-p", `:${repoPath}`], {
+                ignoreErrors: true,
+            });
+            const source = indexed.stdout.length > 0 ? indexed.stdout : "";
+            const patched = applyUnifiedPatch(source, patch);
+            this.lg2.fs.writeFile(memPath, patched);
+            await this.lg2.run(MEM_ROOT, ["add", repoPath]);
+            if (originalExists) {
+                this.lg2.fs.writeFile(memPath, original);
+            } else if (this.lg2.fs.analyzePath(memPath).exists) {
+                this.lg2.fs.unlink(memPath);
+            }
+        } finally {
+            await this.syncOut();
+        }
+    }
+
+    /**
+     * Soft-resets onto the tracking branch and recommits unpushed work as
+     * one commit, reusing the previous HEAD message. No-op when there is
+     * no tracking branch, fewer than two unpushed commits, staged but
+     * uncommitted changes, or a merge in the unpushed range.
+     */
+    async squashAllUnpushedCommits(): Promise<void> {
+        const branchInfo = await this.branchInfo();
+        if (!branchInfo.tracking || !branchInfo.current) return;
+        const remoteBranches = await this.getRemoteBranches(
+            splitRemoteBranch(branchInfo.tracking)[0]
+        );
+        if (!remoteBranches.includes(branchInfo.tracking)) return;
+        const status = await this.status();
+        if (status.staged.length > 0) return;
+        const unpushed = await this.getUnpushedCommits();
+        if (unpushed < 2) return;
+        const history = await this.log(undefined, false, unpushed);
+        if (history.some((entry) => entry.message.startsWith("Merge"))) {
+            return;
+        }
+        const oldHead = await this.revParse("HEAD");
+        const tracking = await this.revParse(branchInfo.tracking);
+        if (!oldHead || !tracking) return;
+        const previous = await this.catFileCommit(oldHead);
+        if (!previous) return;
+        await this.withGitOperation(GitOperation.commit, async () => {
+            await this.mutate(["reset", "--soft", tracking]);
+            await this.mutate(["commit", "-m", previous.message.trim()]);
+            this.app.workspace.trigger("obsidian-git:head-change");
+        });
     }
 
     /** `git describe --tags` output, or undefined when nothing describes HEAD. */

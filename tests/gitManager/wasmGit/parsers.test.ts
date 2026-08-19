@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+    applyUnifiedPatch,
     extractFileDiff,
+    extractPatchPath,
     parseBlame,
     parseCommitObject,
     parseForEachRef,
@@ -401,5 +403,27 @@ describe("splitCommandLine", () => {
 
     it("returns an empty list for blank input", () => {
         expect(splitCommandLine("   ")).toEqual([]);
+    });
+});
+
+describe("applyUnifiedPatch", () => {
+    it("splices added and removed lines at the hunk start", () => {
+        const source = "base\n";
+        const patch = [
+            "--- a/note.md",
+            "+++ b/note.md",
+            "@@ -1,1 +1,2 @@",
+            "-base",
+            "+base",
+            "+working",
+            "",
+        ].join("\n");
+        expect(applyUnifiedPatch(source, patch)).toBe("base\nworking\n");
+    });
+
+    it("extracts the +++ b/ path", () => {
+        expect(
+            extractPatchPath("diff --git a/x b/x\n+++ b/folder/note.md\n")
+        ).toBe("folder/note.md");
     });
 });
