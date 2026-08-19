@@ -528,6 +528,48 @@ describe("WasmGit history", () => {
     });
 });
 
+describe("WasmGit gitdir-only reads", () => {
+    it("history and status-bar reads never mirror working tree files", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        // A tracking branch against a local bare remote lets
+        // getUnpushedCommits exercise its rev-list path.
+        const remoteDir = createTempDirectory("obsidian-git-wasm-remote-");
+        withCleanup({ cleanup: () => cleanupTempDirectory(remoteDir) });
+        await git(remoteDir, ["init", "--bare", "--initial-branch=main", "."]);
+        await git(vault.dir, ["remote", "add", "origin", remoteDir]);
+        await git(vault.dir, ["push", "--quiet", "-u", "origin", "main"]);
+        writeFileSync(path.join(vault.dir, "unpushed.md"), "unpushed\n");
+        await git(vault.dir, ["add", "unpushed.md"]);
+        await git(vault.dir, ["commit", "-m", "unpushed"]);
+
+        const readBinary = vi.spyOn(vault.adapter, "readBinary");
+        const list = vi.spyOn(vault.adapter, "list");
+
+        expect(await vault.manager.getLastCommitTime()).toBeInstanceOf(Date);
+        expect(await vault.manager.getUnpushedCommits()).toBe(1);
+        expect((await vault.manager.branchInfo()).current).toBe("main");
+        const log = await vault.manager.log(undefined, false, 10);
+        expect(log).toHaveLength(2);
+        expect(await vault.manager.lsFiles()).toEqual([
+            "note.md",
+            "unpushed.md",
+        ]);
+
+        // Only .git may be mirrored into memory. Reading working tree
+        // files here would make these frequent reads (status bar, side
+        // pane, history) scale with the vault size, which exhausts memory
+        // and crash-loops Obsidian on iOS.
+        expect(readBinary).toHaveBeenCalled();
+        for (const call of readBinary.mock.calls) {
+            expect(call[0]).toMatch(/^\.git\//);
+        }
+        for (const call of list.mock.calls) {
+            expect(call[0]).toMatch(/^\.git(\/|$)/);
+        }
+    });
+});
+
 describe("WasmGit branches", () => {
     it("creates, switches, lists, and deletes branches", async () => {
         const vault = createVault();

@@ -48,8 +48,10 @@ const PATH_BATCH_SIZE = 50;
  *
  * The engine runs against an in-memory filesystem that is kept in sync with
  * the vault by {@link VaultMirror}: the working tree is re-synced from the
- * vault before every operation, and both the working tree and the `.git`
- * directory are persisted back to the vault after mutating operations.
+ * vault before every operation that reads or writes it, and both the working
+ * tree and the `.git` directory are persisted back to the vault after
+ * mutating operations. Operations that only inspect repository state go
+ * through {@link readGitDir} and skip the working-tree sync entirely.
  * Commands are serialized through {@link Lg2}'s mutex on the plugin thread
  * because Obsidian's adapter and `requestUrl` are main-thread APIs.
  * Remote access goes through {@link WasmGitHttpBridge} on top of Obsidian's
@@ -169,6 +171,25 @@ export class WasmGit extends GitManager {
         opts?: { ignoreErrors?: boolean }
     ): Promise<{ stdout: string; stderr: string }> {
         await this.syncIn();
+        return this.lg2.run(MEM_ROOT, args, opts);
+    }
+
+    /**
+     * Runs a read-only command that only inspects the repository state in
+     * `.git` (refs, history, index, and object contents) and never the
+     * working tree, so the vault's files are not mirrored into memory.
+     *
+     * This distinction is critical on mobile: mirroring every vault file
+     * just to answer e.g. `rev-parse HEAD` makes plugin startup and every
+     * status-bar or history refresh scale with the vault size. On iOS the
+     * resulting memory spike gets the app killed and relaunched in a loop
+     * as soon as the plugin is enabled.
+     */
+    private async readGitDir(
+        args: string[],
+        opts?: { ignoreErrors?: boolean }
+    ): Promise<{ stdout: string; stderr: string }> {
+        await this.ensureReady();
         return this.lg2.run(MEM_ROOT, args, opts);
     }
 
@@ -434,7 +455,7 @@ export class WasmGit extends GitManager {
     }
 
     private async headExists(): Promise<boolean> {
-        const result = await this.read(["rev-parse", "HEAD"], {
+        const result = await this.readGitDir(["rev-parse", "HEAD"], {
             ignoreErrors: true,
         });
         return /^[0-9a-f]{40}$/m.test(result.stdout);
@@ -521,7 +542,7 @@ export class WasmGit extends GitManager {
                     return 0;
                 }
                 if (amend) {
-                    const parentExists = await this.read(
+                    const parentExists = await this.readGitDir(
                         ["rev-parse", "HEAD~1"],
                         { ignoreErrors: true }
                     );
@@ -765,7 +786,7 @@ export class WasmGit extends GitManager {
         if (!branchInfo.current || !branchInfo.tracking) {
             return 0;
         }
-        const result = await this.read(
+        const result = await this.readGitDir(
             ["rev-list", `${branchInfo.tracking}..HEAD`],
             { ignoreErrors: true }
         );
@@ -809,7 +830,7 @@ export class WasmGit extends GitManager {
                 current = symref ? symref[1] : undefined;
             }
 
-            const refs = await this.read(["for-each-ref"], {
+            const refs = await this.readGitDir(["for-each-ref"], {
                 ignoreErrors: true,
             });
             const branches = parseForEachRef(refs.stdout)
@@ -910,9 +931,10 @@ export class WasmGit extends GitManager {
     }
 
     async branchIsMerged(branch: string): Promise<boolean> {
-        const result = await this.read(["rev-list", branch, "--not", "HEAD"], {
-            ignoreErrors: true,
-        });
+        const result = await this.readGitDir(
+            ["rev-list", branch, "--not", "HEAD"],
+            { ignoreErrors: true }
+        );
         return !/^[0-9a-f]{40}$/m.test(result.stdout);
     }
 
@@ -1047,14 +1069,14 @@ export class WasmGit extends GitManager {
     }
 
     async getRemotes(): Promise<string[]> {
-        const result = await this.read(["remote", "show"], {
+        const result = await this.readGitDir(["remote", "show"], {
             ignoreErrors: true,
         });
         return result.stdout.split("\n").filter((line) => line.length > 0);
     }
 
     async getRemoteUrl(remote: string): Promise<string | undefined> {
-        const result = await this.read(["remote", "show", "-v"], {
+        const result = await this.readGitDir(["remote", "show", "-v"], {
             ignoreErrors: true,
         });
         return parseRemoteVerbose(result.stdout).get(remote);
@@ -1067,7 +1089,7 @@ export class WasmGit extends GitManager {
     async getRemoteBranches(remote: string): Promise<string[]> {
         try {
             const result = await this.withAuthRetry(() =>
-                this.read(["ls-remote", remote])
+                this.readGitDir(["ls-remote", remote])
             );
             const branches = parseLsRemote(result.stdout)
                 .filter((ref) => ref.refName.startsWith("refs/heads/"))
@@ -1080,7 +1102,7 @@ export class WasmGit extends GitManager {
             // Offline or unauthenticated: fall back to the locally known
             // remote-tracking branches below.
         }
-        const refs = await this.read(["for-each-ref"], {
+        const refs = await this.readGitDir(["for-each-ref"], {
             ignoreErrors: true,
         });
         return parseForEachRef(refs.stdout)
@@ -1134,18 +1156,19 @@ export class WasmGit extends GitManager {
         if (file != undefined) {
             args.push("--", this.getRelativeRepoPath(file, relativeToVault));
         }
-        const result = await this.read(args, { ignoreErrors: true });
+        const result = await this.readGitDir(args, { ignoreErrors: true });
         const entries = parseLog(result.stdout);
 
         const logEntries: LogEntry[] = [];
         for (const entry of entries) {
             let files: DiffFile[] = [];
-            const parent = await this.read(["rev-parse", `${entry.hash}~1`], {
-                ignoreErrors: true,
-            });
+            const parent = await this.readGitDir(
+                ["rev-parse", `${entry.hash}~1`],
+                { ignoreErrors: true }
+            );
             const parentHash = parent.stdout.match(/^[0-9a-f]{40}$/m)?.[0];
             if (parentHash) {
-                const diff = await this.read(
+                const diff = await this.readGitDir(
                     ["diff", "--name-status", parentHash, entry.hash],
                     { ignoreErrors: true }
                 );
@@ -1176,7 +1199,7 @@ export class WasmGit extends GitManager {
         commitHash1: string,
         commitHash2: string
     ): Promise<WalkDifference[]> {
-        const result = await this.read(
+        const result = await this.readGitDir(
             ["diff", "--name-status", commitHash1, commitHash2],
             { ignoreErrors: true }
         );
@@ -1189,26 +1212,31 @@ export class WasmGit extends GitManager {
         hash?: string
     ): Promise<string> {
         if (hash) {
-            const parent = await this.read(["rev-parse", `${hash}~1`], {
+            const parent = await this.readGitDir(["rev-parse", `${hash}~1`], {
                 ignoreErrors: true,
             });
             const parentHash = parent.stdout.match(/^[0-9a-f]{40}$/m)?.[0];
             if (parentHash) {
-                const result = await this.read(
+                const result = await this.readGitDir(
                     ["diff", "-p", parentHash, hash],
                     { ignoreErrors: true }
                 );
                 return extractFileDiff(result.stdout, filePath) ?? "";
             }
             // Root commit: synthesize an "added file" patch.
-            const content = await this.read(
+            const content = await this.readGitDir(
                 ["cat-file", "-p", `${hash}:${filePath}`],
                 { ignoreErrors: true }
             );
             return buildAddedFilePatch(filePath, content.stdout);
         }
-        const args = stagedChanges ? ["diff", "--cached"] : ["diff"];
-        const result = await this.read(args, { ignoreErrors: true });
+        // Staged changes compare the index against HEAD; only the unstaged
+        // diff needs the working tree mirrored in.
+        const result = stagedChanges
+            ? await this.readGitDir(["diff", "--cached"], {
+                  ignoreErrors: true,
+              })
+            : await this.read(["diff"], { ignoreErrors: true });
         return extractFileDiff(result.stdout, filePath) ?? "";
     }
 
@@ -1221,14 +1249,14 @@ export class WasmGit extends GitManager {
     }
 
     async revParse(rev: string): Promise<string | undefined> {
-        const result = await this.read(["rev-parse", rev], {
+        const result = await this.readGitDir(["rev-parse", rev], {
             ignoreErrors: true,
         });
         return result.stdout.match(/^[0-9a-f]{40}$/m)?.[0];
     }
 
     async catFileCommit(hash: string): Promise<ParsedCommitObject | undefined> {
-        const result = await this.read(["cat-file", "-p", hash], {
+        const result = await this.readGitDir(["cat-file", "-p", hash], {
             ignoreErrors: true,
         });
         return parseCommitObject(result.stdout);
@@ -1264,7 +1292,7 @@ export class WasmGit extends GitManager {
 
     /** Lists all stashes (`stash@{n}: message` per line). */
     async stashList(): Promise<string[]> {
-        const result = await this.read(["stash", "list"], {
+        const result = await this.readGitDir(["stash", "list"], {
             ignoreErrors: true,
         });
         return result.stdout.split("\n").filter((line) => line.length > 0);
@@ -1299,7 +1327,7 @@ export class WasmGit extends GitManager {
 
     /** Lists all tag names. */
     async tagList(): Promise<string[]> {
-        const refs = await this.read(["for-each-ref"], {
+        const refs = await this.readGitDir(["for-each-ref"], {
             ignoreErrors: true,
         });
         return parseForEachRef(refs.stdout)
@@ -1386,7 +1414,7 @@ export class WasmGit extends GitManager {
             }
             return indexed;
         }
-        const result = await this.read([
+        const result = await this.readGitDir([
             "cat-file",
             "-p",
             `${commitHash}:${repoPath}`,
@@ -1399,7 +1427,7 @@ export class WasmGit extends GitManager {
         commit1: string,
         commit2: string
     ): Promise<string> {
-        const result = await this.read(["diff", "-p", commit1, commit2], {
+        const result = await this.readGitDir(["diff", "-p", commit1, commit2], {
             ignoreErrors: true,
         });
         return extractFileDiff(result.stdout, file) ?? "";
@@ -1472,7 +1500,7 @@ export class WasmGit extends GitManager {
 
     /** `git describe --tags` output, or undefined when nothing describes HEAD. */
     async describe(): Promise<string | undefined> {
-        const result = await this.read(["describe", "--tags"], {
+        const result = await this.readGitDir(["describe", "--tags"], {
             ignoreErrors: true,
         });
         const description = result.stdout.trim();
@@ -1481,7 +1509,9 @@ export class WasmGit extends GitManager {
 
     /** All paths currently tracked in the index. */
     async lsFiles(): Promise<string[]> {
-        const result = await this.read(["ls-files"], { ignoreErrors: true });
+        const result = await this.readGitDir(["ls-files"], {
+            ignoreErrors: true,
+        });
         return result.stdout.split("\n").filter((line) => line.length > 0);
     }
 
@@ -1521,7 +1551,7 @@ export class WasmGit extends GitManager {
 
     /** Reads the staged blob for `repoPath`, or undefined if it is untracked. */
     private async readIndexFile(repoPath: string): Promise<string | undefined> {
-        const listed = await this.read(["ls-files", "-s"], {
+        const listed = await this.readGitDir(["ls-files", "-s"], {
             ignoreErrors: true,
         });
         const escaped = repoPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1529,14 +1559,14 @@ export class WasmGit extends GitManager {
             new RegExp(`^[0-7]+ ([0-9a-f]{40})\\s+${escaped}$`, "m")
         )?.[1];
         if (hash) {
-            const blob = await this.read(["cat-file", "-p", hash], {
+            const blob = await this.readGitDir(["cat-file", "-p", hash], {
                 ignoreErrors: true,
             });
             return blob.stdout;
         }
         // lg2 may omit -s details or pathspecs; HEAD:path is the usual
         // index content when nothing is staged.
-        const fromHead = await this.read(
+        const fromHead = await this.readGitDir(
             ["cat-file", "-p", `HEAD:${repoPath}`],
             { ignoreErrors: true }
         );
