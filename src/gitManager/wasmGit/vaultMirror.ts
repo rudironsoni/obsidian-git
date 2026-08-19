@@ -65,7 +65,13 @@ export class VaultMirror {
     /** Copies vault-side changes into the in-memory filesystem. */
     async syncIn(): Promise<void> {
         this.ensureMemDir(this.memRoot);
-        const vaultFiles = await this.walkVault();
+        const { files: vaultFiles, dirs: vaultDirs } = await this.walkVault();
+
+        // Replicate directories even when empty: git requires e.g.
+        // `.git/objects` and `.git/refs` to exist for a valid layout.
+        for (const dir of vaultDirs) {
+            this.ensureMemDir(this.toMemPath(dir));
+        }
 
         for (const [relativePath, meta] of vaultFiles) {
             const known = this.manifest.get(relativePath);
@@ -94,7 +100,7 @@ export class VaultMirror {
 
         // Drop stray files that exist only in memory (e.g. leftovers of a
         // failed operation) so git sees exactly the vault state.
-        for (const relativePath of this.walkMem().keys()) {
+        for (const relativePath of this.walkMem().files.keys()) {
             if (!vaultFiles.has(relativePath)) {
                 this.removeMemFile(this.toMemPath(relativePath));
             }
@@ -103,7 +109,12 @@ export class VaultMirror {
 
     /** Writes files changed by git in the in-memory filesystem to the vault. */
     async syncOut(): Promise<void> {
-        const memFiles = this.walkMem();
+        const { files: memFiles, dirs: memDirs } = this.walkMem();
+
+        for (const dir of memDirs) {
+            await this.ensureVaultDir(this.toVaultPath(dir));
+        }
+
         for (const [relativePath, meta] of memFiles) {
             const known = this.manifest.get(relativePath);
             if (
@@ -116,7 +127,16 @@ export class VaultMirror {
             const vaultPath = this.toVaultPath(relativePath);
             await this.ensureVaultDir(parentOf(vaultPath));
             const data = this.fs.readFile(this.toMemPath(relativePath));
-            await this.adapter.writeBinary(vaultPath, toArrayBuffer(data));
+            // Skip rewriting files whose content did not actually change
+            // (libgit2 sometimes rewrites identical loose objects, and
+            // object files may be read-only when created by native git).
+            const unchanged =
+                known != undefined &&
+                known.size === meta.size &&
+                (await this.vaultContentEquals(vaultPath, data));
+            if (!unchanged) {
+                await this.adapter.writeBinary(vaultPath, toArrayBuffer(data));
+            }
             const stat = await this.adapter.stat(vaultPath);
             const newMeta: FileMeta = {
                 mtime: stat?.mtime ?? meta.mtime,
@@ -151,17 +171,23 @@ export class VaultMirror {
         this.manifest.clear();
     }
 
-    private async walkVault(): Promise<Map<string, FileMeta>> {
+    private async walkVault(): Promise<{
+        files: Map<string, FileMeta>;
+        dirs: string[];
+    }> {
         const files = new Map<string, FileMeta>();
+        const dirs: string[] = [];
         if (!(await this.adapter.exists(this.vaultRoot || "/"))) {
-            return files;
+            return { files, dirs };
         }
         const pending: string[] = [this.vaultRoot];
         while (pending.length > 0) {
             const dir = pending.pop()!;
             const listing = await this.adapter.list(dir || "/");
             for (const folder of listing.folders) {
-                if (!this.exclude(this.toRelative(folder))) {
+                const relativePath = this.toRelative(folder);
+                if (!this.exclude(relativePath)) {
+                    dirs.push(relativePath);
                     pending.push(folder);
                 }
             }
@@ -176,7 +202,7 @@ export class VaultMirror {
                 });
             }
         }
-        return files;
+        return { files, dirs };
     }
 
     private toRelative(vaultPath: string): string {
@@ -186,9 +212,12 @@ export class VaultMirror {
             : vaultPath;
     }
 
-    private walkMem(): Map<string, FileMeta> {
+    private walkMem(): { files: Map<string, FileMeta>; dirs: string[] } {
         const files = new Map<string, FileMeta>();
-        if (!this.fs.analyzePath(this.memRoot).exists) return files;
+        const dirs: string[] = [];
+        if (!this.fs.analyzePath(this.memRoot).exists) {
+            return { files, dirs };
+        }
         const pending: string[] = [this.memRoot];
         while (pending.length > 0) {
             const dir = pending.pop()!;
@@ -199,6 +228,7 @@ export class VaultMirror {
                 if (this.exclude(relativePath)) continue;
                 const stat = this.fs.stat(memPath);
                 if (this.fs.isDir(stat.mode)) {
+                    dirs.push(relativePath);
                     pending.push(memPath);
                 } else if (this.fs.isFile(stat.mode)) {
                     files.set(relativePath, {
@@ -208,7 +238,22 @@ export class VaultMirror {
                 }
             }
         }
-        return files;
+        return { files, dirs };
+    }
+
+    private async vaultContentEquals(
+        vaultPath: string,
+        data: Uint8Array
+    ): Promise<boolean> {
+        if (!(await this.adapter.exists(vaultPath))) return false;
+        const existing = new Uint8Array(
+            await this.adapter.readBinary(vaultPath)
+        );
+        if (existing.length !== data.length) return false;
+        for (let i = 0; i < data.length; i++) {
+            if (existing[i] !== data[i]) return false;
+        }
+        return true;
     }
 
     private ensureMemDir(path: string): void {
