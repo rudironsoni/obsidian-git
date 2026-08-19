@@ -17,11 +17,21 @@
         "all": "pnpm run tsc && pnpm run svelte && pnpm run format && pnpm run lint && pnpm run test"
     },
     "keywords": [],
-    "author": "Vinzent03",
+    "author": "Rudimar Ronsoni",
     "license": "MIT",
     "type": "module",
     "standard-version": {
-        "t": ""
+        "t": "",
+        "bumpFiles": [
+            {
+                "filename": "package.json",
+                "type": "json"
+            },
+            {
+                "filename": "manifest.json",
+                "type": "json"
+            }
+        ]
     },
     "engines": {
         "node": ">=24",
