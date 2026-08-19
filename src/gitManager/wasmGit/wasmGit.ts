@@ -128,6 +128,29 @@ export class WasmGit extends GitManager {
             // owned by this engine afterwards; only git itself modifies it.
             await this.gitDirMirror!.syncIn();
             this.gitDirLoaded = true;
+            await this.normalizeRepoConfig();
+        }
+    }
+
+    /**
+     * Repositories created by native git on desktop record
+     * `core.filemode = true`. The in-memory filesystem reports one fixed mode
+     * for every file, which would make all tracked files appear modified, so
+     * the flag is forced off once per session.
+     */
+    private async normalizeRepoConfig(): Promise<void> {
+        const configPath = `${MEM_GITDIR}/config`;
+        if (!this.lg2.fs.analyzePath(configPath).exists) return;
+        const content = this.lg2.fs.readFile(configPath, {
+            encoding: "utf8",
+        });
+        const normalized = content.replace(
+            /^(\s*filemode\s*=\s*)true\s*$/im,
+            "$1false"
+        );
+        if (normalized !== content) {
+            this.lg2.fs.writeFile(configPath, normalized);
+            await this.gitDirMirror!.syncOut();
         }
     }
 
@@ -915,6 +938,9 @@ export class WasmGit extends GitManager {
             }
             // The base path may have been changed right before this call;
             // rebuild the mirrors so they match the clone target.
+            if (!this.lg2.initialized) {
+                await this.lg2.init();
+            }
             this.buildMirrors();
             await this.syncIn();
             const fs = this.lg2.fs;
@@ -928,7 +954,7 @@ export class WasmGit extends GitManager {
                     },
                 })
             );
-            if (fs.analyzePath(MEM_GITDIR).exists) {
+            if (fs.analyzePath(`${MEM_GITDIR}/HEAD`).exists) {
                 throw new Error(
                     "A git repository already exists at the clone target."
                 );
@@ -937,6 +963,11 @@ export class WasmGit extends GitManager {
                 .readFile(`${cloneDir}/.git/HEAD`, { encoding: "utf8" })
                 .trim();
             const branch = head.match(/^ref: refs\/heads\/(.*)$/)?.[1];
+            if (fs.analyzePath(MEM_GITDIR).exists) {
+                // The mirror pre-creates the (empty) directory; remove it so
+                // the cloned .git can be moved into place.
+                removeMemTree(fs, MEM_GITDIR);
+            }
             fs.rename(`${cloneDir}/.git`, MEM_GITDIR);
             removeMemTree(fs, cloneDir);
             // Materialize the working tree in place. This intentionally
