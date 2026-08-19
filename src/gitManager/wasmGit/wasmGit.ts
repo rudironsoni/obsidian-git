@@ -1521,15 +1521,26 @@ export class WasmGit extends GitManager {
 
     /** Reads the staged blob for `repoPath`, or undefined if it is untracked. */
     private async readIndexFile(repoPath: string): Promise<string | undefined> {
-        const listed = await this.read(["ls-files", "-s", "--", repoPath], {
+        const listed = await this.read(["ls-files", "-s"], {
             ignoreErrors: true,
         });
-        const hash = listed.stdout.match(/^[0-7]+ ([0-9a-f]{40}) /m)?.[1];
-        if (!hash) return undefined;
-        const result = await this.read(["cat-file", "-p", hash], {
-            ignoreErrors: true,
-        });
-        return result.stdout;
+        const escaped = repoPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const hash = listed.stdout.match(
+            new RegExp(`^[0-7]+ ([0-9a-f]{40})\\s+${escaped}$`, "m")
+        )?.[1];
+        if (hash) {
+            const blob = await this.read(["cat-file", "-p", hash], {
+                ignoreErrors: true,
+            });
+            return blob.stdout;
+        }
+        // lg2 may omit -s details or pathspecs; HEAD:path is the usual
+        // index content when nothing is staged.
+        const fromHead = await this.read(
+            ["cat-file", "-p", `HEAD:${repoPath}`],
+            { ignoreErrors: true }
+        );
+        return fromHead.stdout.length > 0 ? fromHead.stdout : undefined;
     }
 
     updateGitPath(_: string): Promise<void> {
