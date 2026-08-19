@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractChangelogSection } from "../../scripts/extract-changelog.mjs";
+import { extractChangelogSection } from "../../scripts/extract-changelog";
 
 const changelog = `# Changelog
 

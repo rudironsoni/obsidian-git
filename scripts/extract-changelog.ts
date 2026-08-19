@@ -8,18 +8,16 @@ const VERSION_HEADING =
 /**
  * Return the CHANGELOG.md section for `version`, from its heading through
  * the line before the next version heading.
- *
- * @param {string} changelog
- * @param {string} version
- * @returns {string}
  */
-export function extractChangelogSection(changelog, version) {
-    if (typeof version !== "string" || version.length === 0) {
+export function extractChangelogSection(
+    changelog: string,
+    version: string
+): string {
+    if (version.length === 0) {
         throw new Error("A changelog version is required.");
     }
 
     VERSION_HEADING.lastIndex = 0;
-    /** @type {RegExpExecArray | null} */
     let match = VERSION_HEADING.exec(changelog);
     let start = -1;
     let end = changelog.length;
@@ -43,7 +41,7 @@ export function extractChangelogSection(changelog, version) {
     return changelog.slice(start, end).trimEnd() + "\n";
 }
 
-function isDirectRun() {
+function isDirectRun(): boolean {
     return (
         process.argv[1] != null &&
         import.meta.url === pathToFileURL(resolve(process.argv[1])).href
@@ -53,7 +51,7 @@ function isDirectRun() {
 if (isDirectRun()) {
     const version = process.argv[2];
     if (version == null || version.length === 0) {
-        console.error("Usage: node scripts/extract-changelog.mjs <version>");
+        console.error("Usage: node scripts/extract-changelog.ts <version>");
         process.exit(1);
     }
 
