@@ -2,12 +2,22 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const VERSION_HEADING =
-    /^#{2,3} \[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\]/gm;
+const VERSION = "\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?";
+const VERSION_HEADING = new RegExp(
+    `^#{2,3} (?:\\[(${VERSION})\\]|(${VERSION})\\b)`,
+    "gm"
+);
+
+function headingVersion(match: RegExpExecArray): string {
+    return match[1] ?? match[2] ?? "";
+}
 
 /**
  * Return the CHANGELOG.md section for `version`, from its heading through
  * the line before the next version heading.
+ *
+ * Accepts both linked headings (`## [1.2.3](url)`) and the unlinked first
+ * release heading that standard-version writes (`## 1.2.3 (date)`).
  */
 export function extractChangelogSection(
     changelog: string,
@@ -23,7 +33,7 @@ export function extractChangelogSection(
     let end = changelog.length;
 
     while (match !== null) {
-        if (match[1] === version) {
+        if (headingVersion(match) === version) {
             start = match.index;
             const next = VERSION_HEADING.exec(changelog);
             if (next !== null) {

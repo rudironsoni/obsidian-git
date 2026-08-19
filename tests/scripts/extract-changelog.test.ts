@@ -1,7 +1,14 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { extractChangelogSection } from "../../scripts/extract-changelog";
 
 const changelog = `# Changelog
+
+## 3.0.0 (2026-08-19)
+
+### Features
+
+* first fork release notes
 
 ## [2.39.0](https://example.com/compare/2.38.6...2.39.0) (2026-08-12)
 
@@ -19,6 +26,17 @@ const changelog = `# Changelog
 `;
 
 describe("extractChangelogSection", () => {
+    it("extracts an unlinked first-release heading written by standard-version", () => {
+        expect(extractChangelogSection(changelog, "3.0.0")).toBe(
+            `## 3.0.0 (2026-08-19)
+
+### Features
+
+* first fork release notes
+`
+        );
+    });
+
     it("extracts a version section and stops before the next heading", () => {
         expect(extractChangelogSection(changelog, "2.39.0")).toBe(
             `## [2.39.0](https://example.com/compare/2.38.6...2.39.0) (2026-08-12)
@@ -58,5 +76,13 @@ describe("extractChangelogSection", () => {
         expect(() => extractChangelogSection(changelog, "")).toThrow(
             /A changelog version is required/
         );
+    });
+
+    it("extracts 3.0.0 from the repository CHANGELOG.md", () => {
+        const realChangelog = readFileSync("CHANGELOG.md", "utf8");
+        const section = extractChangelogSection(realChangelog, "3.0.0");
+        expect(section.startsWith("## 3.0.0")).toBe(true);
+        expect(section).toContain("BREAKING CHANGES");
+        expect(section).not.toContain("## [2.39.0]");
     });
 });
