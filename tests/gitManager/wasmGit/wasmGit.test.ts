@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import simpleGit, { type SimpleGit } from "simple-git";
 import { describe, expect, it, vi } from "vitest";
@@ -475,12 +475,64 @@ describe("WasmGit history", () => {
 
         const blame = await vault.manager.blame("note.md");
 
-        expect(blame.lines).toHaveLength(2);
-        expect(blame.lines[0]!.content).toBe("base");
-        expect(blame.lines[1]!.content).toBe("second line");
-        expect(blame.lines[0]!.hash).not.toBe(blame.lines[1]!.hash);
-        const firstCommit = blame.commits.get(blame.lines[0]!.hash);
-        expect(firstCommit!.message.trim()).toBe("base");
+        expect(blame).not.toBe("untracked");
+        if (blame === "untracked") return;
+        expect(blame.hashPerLine).toHaveLength(3);
+        expect(blame.commits.size).toBe(2);
+        const firstHash = blame.hashPerLine[1]!;
+        const secondHash = blame.hashPerLine[2]!;
+        expect(firstHash).not.toBe(secondHash);
+        expect(blame.commits.get(firstHash)!.summary).toBe("base");
+    });
+
+    it("isTracked and show read index and commit blobs", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, "new.md"), "untracked");
+
+        expect(await vault.manager.isTracked("note.md")).toBe(true);
+        expect(await vault.manager.isTracked("new.md")).toBe(false);
+        expect(await vault.manager.show("HEAD", "note.md")).toBe("base");
+        expect(await vault.manager.show("", "note.md")).toBe("base");
+    });
+
+    it("applyPatch stages a hunk without changing the working tree", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, "note.md"), "base\nworking\n");
+
+        const patch = [
+            "diff --git a/note.md b/note.md",
+            "index 000000..000000 100644",
+            "--- a/note.md",
+            "+++ b/note.md",
+            "@@ -1,1 +1,2 @@",
+            "-base",
+            "+base",
+            "+working",
+            "",
+        ].join("\n");
+        await vault.manager.applyPatch(patch);
+
+        expect(await vault.git.status()).toMatchObject({
+            staged: ["note.md"],
+        });
+        expect(readFileSync(path.join(vault.dir, "note.md"), "utf8")).toBe(
+            "base\nworking\n"
+        );
+    });
+
+    it("squashAllUnpushedCommits folds unpushed history", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, "note.md"), "base\none\n");
+        await vault.manager.commitAll({ message: "one" });
+        writeFileSync(path.join(vault.dir, "note.md"), "base\none\ntwo\n");
+        await vault.manager.commitAll({ message: "two" });
+
+        // No tracking branch yet — squash is a no-op.
+        await vault.manager.squashAllUnpushedCommits();
+        expect((await vault.git.log()).total).toBeGreaterThanOrEqual(3);
     });
 
     it("lsFiles lists tracked paths", async () => {

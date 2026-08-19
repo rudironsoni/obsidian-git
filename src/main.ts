@@ -29,7 +29,6 @@ import {
     SPLIT_DIFF_VIEW_CONFIG,
 } from "./constants";
 import type { GitManager } from "./gitManager/gitManager";
-import { SimpleGit } from "./gitManager/simpleGit";
 import { WasmGit } from "./gitManager/wasmGit/wasmGit";
 import { LocalStorageSettings } from "./setting/localStorageSettings";
 import Tools from "./tools";
@@ -536,10 +535,6 @@ export default class ObsidianGit extends Plugin {
         await this.saveData(this.settings);
     }
 
-    get useSimpleGit(): boolean {
-        return Platform.isDesktopApp;
-    }
-
     async init({ fromReload = false }): Promise<void> {
         if (this.localStorage.getPluginDisabled()) {
             // This is already guarded in `onload`, but we also guard here to
@@ -555,12 +550,7 @@ export default class ObsidianGit extends Plugin {
         }
 
         try {
-            if (this.useSimpleGit) {
-                this.gitManager = new SimpleGit(this);
-                await (this.gitManager as SimpleGit).setGitInstance();
-            } else {
-                this.gitManager = new WasmGit(this);
-            }
+            this.gitManager = new WasmGit(this);
 
             const result = await this.gitManager.checkRequirements();
             const pausedAutomatics = this.localStorage.getPausedAutomatics();
@@ -658,10 +648,10 @@ export default class ObsidianGit extends Plugin {
             const confirmOption = "Vault Root";
             let dir = await new GeneralModal(this, {
                 options:
-                    this.gitManager instanceof WasmGit ? [confirmOption] : [],
+                    [confirmOption],
                 placeholder:
                     "Enter directory for clone. It needs to be empty or not existent.",
-                allowEmpty: this.gitManager instanceof WasmGit,
+                allowEmpty: true,
             }).openAndGetResult();
             if (dir == undefined) return;
             if (dir === confirmOption) {
@@ -930,7 +920,7 @@ export default class ObsidianGit extends Plugin {
 
                     // On desktop may run a script to get the commit message
                 } else if (
-                    this.gitManager instanceof SimpleGit &&
+                    Platform.isDesktopApp &&
                     this.settings.commitMessageScript
                 ) {
                     const templateScript = this.settings.commitMessageScript;
@@ -967,10 +957,15 @@ export default class ObsidianGit extends Plugin {
                         }
                     }
 
+                    const adapter = this.app.vault.adapter as FileSystemAdapter;
+                    const vaultRoot = adapter.getBasePath();
+                    const cwd = this.settings.basePath
+                        ? path.join(vaultRoot, this.settings.basePath)
+                        : vaultRoot;
                     const res = await spawnAsync(
                         shPath,
                         ["-c", formattedScript],
-                        { cwd: this.gitManager.absoluteRepoPath }
+                        { cwd }
                     );
                     if (res.code != 0) {
                         this.displayError(res.stderr);
@@ -1014,7 +1009,7 @@ export default class ObsidianGit extends Plugin {
                         unstagedFiles.length + stagedFiles.length || 0;
                 }
                 if (committedFiles === 0) {
-                    // simple-git resolves with { changes: 0 } instead of
+                    // The git manager may report 0 changes instead of
                     // throwing when there is nothing to commit (e.g. the
                     // detected change was already committed by a previous run).
                     // Report this honestly instead of "Committed 0 files".
@@ -1065,10 +1060,7 @@ export default class ObsidianGit extends Plugin {
             // Squash local unpushed commits into one before pushing, so frequent
             // local commits don't clutter the remote history. Only unpushed
             // history is rewritten (no force-push). Conflicts are excluded above.
-            if (
-                this.settings.squashCommitsBeforePush &&
-                this.gitManager instanceof SimpleGit
-            ) {
+            if (this.settings.squashCommitsBeforePush) {
                 await this.gitManager.squashAllUnpushedCommits();
             }
             this.log("Pushing....");
@@ -1276,9 +1268,8 @@ export default class ObsidianGit extends Plugin {
             return true;
         }
         if (
-            this.gitManager instanceof SimpleGit &&
             (await this.gitManager.getConfig("push.autoSetupRemote", "all")) ==
-                "true"
+            "true"
         ) {
             return true;
         }

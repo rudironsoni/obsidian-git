@@ -74,7 +74,6 @@ const context = await esbuild.context({
             preprocess: sveltePreprocess(),
         }),
     ],
-    inject: ["polyfill_buffer.js"],
     outfile: "main.js",
 });
 

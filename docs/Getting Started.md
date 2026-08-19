@@ -40,7 +40,7 @@ Another alternative for iOS is [Working Copy](https://workingcopy.app/).
 
 ## Restrictions
 
-I am using [wasm-git](https://github.com/petersalomonsen/wasm-git), a WebAssembly build of [libgit2](https://libgit2.org/), because you cannot use native Git on Android or iOS.
+Desktop and mobile both use [wasm-git](https://github.com/petersalomonsen/wasm-git), a WebAssembly build of [libgit2](https://libgit2.org/). A native Git installation is not required.
 
 -   SSH authentication is not supported; only HTTP/HTTPS remotes with token or password authentication work
 -   Repo size is limited, because the repository is mirrored into memory for Git operations

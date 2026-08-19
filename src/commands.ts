@@ -1,6 +1,5 @@
 import { Notice, TFolder, WorkspaceLeaf } from "obsidian";
 import { HISTORY_VIEW_CONFIG, SOURCE_CONTROL_VIEW_CONFIG } from "./constants";
-import { SimpleGit } from "./gitManager/simpleGit";
 import { WasmGit } from "./gitManager/wasmGit/wasmGit";
 import ObsidianGit from "./main";
 import { openHistoryInGitHub, openLineInGitHub } from "./openInGitHub";
@@ -474,10 +473,7 @@ export function addCommmands(plugin: ObsidianGit) {
         checkCallback: (checking) => {
             const gitManager = plugin.gitManager;
             if (checking) {
-                return (
-                    gitManager instanceof SimpleGit ||
-                    gitManager instanceof WasmGit
-                );
+                return gitManager != undefined;
             } else {
                 plugin.tools
                     .runRawCommand()
