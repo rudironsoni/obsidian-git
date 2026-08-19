@@ -370,6 +370,12 @@ export class NoNetworkError extends Error {
     }
 }
 
+export class UserCanceledError extends Error {
+    constructor() {
+        super("The user canceled the operation");
+    }
+}
+
 export type ElectronWindow = Window & {
     electron: {
         shell: {

@@ -6,6 +6,7 @@ import {
 } from "./constants";
 import type ObsidianGit from "./main";
 import { SimpleGit } from "./gitManager/simpleGit";
+import { WasmGit } from "./gitManager/wasmGit/wasmGit";
 import { getNewLeaf, splitRemoteBranch } from "./utils";
 import { GeneralModal } from "./ui/modals/generalModal";
 import type { DiffViewState } from "./types";
@@ -142,7 +143,10 @@ export default class Tools {
 
     async runRawCommand() {
         const gitManager = this.plugin.gitManager;
-        if (!(gitManager instanceof SimpleGit)) {
+        if (
+            !(gitManager instanceof SimpleGit) &&
+            !(gitManager instanceof WasmGit)
+        ) {
             return;
         }
         const modal = new GeneralModal(this.plugin, {

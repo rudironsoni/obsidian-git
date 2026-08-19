@@ -12,7 +12,7 @@ import {
     DEFAULT_SETTINGS,
     GIT_LINE_AUTHORING_MOVEMENT_DETECTION_MINIMAL_LENGTH,
 } from "src/constants";
-import { IsomorphicGit } from "src/gitManager/isomorphicGit";
+import { WasmGit } from "src/gitManager/wasmGit/wasmGit";
 import { SimpleGit } from "src/gitManager/simpleGit";
 import { previewColor } from "src/editor/lineAuthor/lineAuthorProvider";
 import type {
@@ -774,7 +774,7 @@ export class ObsidianGitSettingsTab extends PluginSettingTab {
                     })
             );
 
-        if (plugin.gitManager instanceof IsomorphicGit) {
+        if (plugin.gitManager instanceof WasmGit) {
             new Setting(containerEl)
                 .setName("Authentication/commit author")
                 .setHeading();
@@ -782,7 +782,7 @@ export class ObsidianGitSettingsTab extends PluginSettingTab {
             new Setting(containerEl).setName("Commit author").setHeading();
         }
 
-        if (plugin.gitManager instanceof IsomorphicGit)
+        if (plugin.gitManager instanceof WasmGit)
             new Setting(containerEl)
                 .setName(
                     "Username on your git server. E.g. your username on GitHub"
@@ -794,7 +794,7 @@ export class ObsidianGitSettingsTab extends PluginSettingTab {
                     });
                 });
 
-        if (plugin.gitManager instanceof IsomorphicGit)
+        if (plugin.gitManager instanceof WasmGit)
             new Setting(containerEl)
                 .setName("Password/Personal access token")
                 .setDesc(
