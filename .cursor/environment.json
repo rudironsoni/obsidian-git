@@ -1,5 +1,4 @@
 {
     "name": "obsidian-git",
-    "install": "bash scripts/cursor-cloud-install.sh",
-    "repositoryDependencies": ["github.com/rudironsoni/influx"]
+    "install": "bash scripts/cursor-cloud-install.sh"
 }
