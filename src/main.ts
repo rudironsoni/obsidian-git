@@ -31,6 +31,7 @@ import {
 import type { GitManager } from "./gitManager/gitManager";
 import { WasmGit } from "./gitManager/wasmGit/wasmGit";
 import { LocalStorageSettings } from "./setting/localStorageSettings";
+import { StartupGuard } from "./startupGuard";
 import Tools from "./tools";
 import type {
     ElectronWindow,
@@ -69,6 +70,7 @@ export default class ObsidianGit extends Plugin {
     automaticsManager = new AutomaticsManager(this);
     tools = new Tools(this);
     localStorage = new LocalStorageSettings(this);
+    startupGuard = new StartupGuard(this.localStorage);
     settings!: ObsidianGitSettings;
     settingsTab?: ObsidianGitSettingsTab;
     statusBar?: StatusBar;
@@ -165,6 +167,19 @@ export default class ObsidianGit extends Plugin {
         this.addSettingTab(this.settingsTab);
 
         if (!this.localStorage.getPluginDisabled()) {
+            if (Platform.isMobileApp) {
+                // Mobile apps are killed without notice, so crash-loop
+                // detection has to be armed before any git work starts.
+                this.startupGuard.recordBoot(
+                    document.visibilityState === "visible"
+                );
+                this.registerDomEvent(document, "visibilitychange", () => {
+                    this.startupGuard.setForeground(
+                        document.visibilityState === "visible"
+                    );
+                });
+            }
+
             this.registerStuff();
 
             this.app.workspace.onLayoutReady(() =>
@@ -520,6 +535,8 @@ export default class ObsidianGit extends Plugin {
 
     onunload() {
         this.unloadPlugin();
+        // A clean unload (disable, update, quit) is not a crash.
+        this.startupGuard.setForeground(false);
 
         console.log("unloading " + this.manifest.name + " plugin");
     }
@@ -544,6 +561,23 @@ export default class ObsidianGit extends Plugin {
             // This is already guarded in `onload`, but we also guard here to
             // avoid any issues if `init` is called directly.
             return;
+        }
+        if (this.startupGuard.isSafeMode()) {
+            if (!fromReload) {
+                // Skipping git startup keeps the app usable after repeated
+                // out-of-memory crash loops; see StartupGuard.
+                new Notice(
+                    "Git: Startup was skipped because Obsidian crashed during " +
+                        "the last launches. This usually means the repository " +
+                        "needs more memory than this device allows. Run any " +
+                        "Git command to try again.",
+                    0
+                );
+                return;
+            }
+            // Reaching init from a reload means the user explicitly ran a
+            // command or changed a setting — retry and re-arm the guard.
+            this.startupGuard.exitSafeMode();
         }
         if (this.settings.showStatusBar && !this.statusBar) {
             const statusBarEl = this.addStatusBarItem();
