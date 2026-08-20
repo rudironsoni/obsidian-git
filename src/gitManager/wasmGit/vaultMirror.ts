@@ -171,6 +171,75 @@ export class VaultMirror {
         this.manifest.clear();
     }
 
+    /**
+     * Copies the given repository-relative files from the vault into memory
+     * without pruning anything else. Used so staging and diffs can operate
+     * on a handful of files instead of the whole vault.
+     */
+    async importFiles(relativePaths: string[]): Promise<void> {
+        this.ensureMemDir(this.memRoot);
+        for (const relativePath of relativePaths) {
+            if (this.exclude(relativePath)) continue;
+            const vaultPath = this.toVaultPath(relativePath);
+            if (!(await this.adapter.exists(vaultPath))) {
+                this.removeMemFile(this.toMemPath(relativePath));
+                this.manifest.delete(relativePath);
+                continue;
+            }
+            const stat = await this.adapter.stat(vaultPath);
+            if (stat?.type !== "file") continue;
+            const known = this.manifest.get(relativePath);
+            if (
+                known &&
+                known.mtime === stat.mtime &&
+                known.size === stat.size
+            ) {
+                continue;
+            }
+            const data = await this.adapter.readBinary(vaultPath);
+            const memPath = this.toMemPath(relativePath);
+            this.ensureMemDir(parentOf(memPath));
+            this.fs.writeFile(memPath, new Uint8Array(data));
+            this.fs.utime(memPath, stat.mtime, stat.mtime);
+            this.manifest.set(relativePath, {
+                mtime: stat.mtime,
+                size: stat.size,
+            });
+        }
+    }
+
+    /**
+     * Writes the given repository-relative files from memory back to the
+     * vault. Paths that exist in memory are created/updated; paths that do
+     * not are removed from the vault. Nothing outside `relativePaths` is
+     * touched, so a partial worktree in memory cannot delete other vault
+     * files.
+     */
+    async exportFiles(relativePaths: string[]): Promise<void> {
+        for (const relativePath of relativePaths) {
+            if (this.exclude(relativePath)) continue;
+            const memPath = this.toMemPath(relativePath);
+            const vaultPath = this.toVaultPath(relativePath);
+            if (!this.fs.analyzePath(memPath).exists) {
+                if (await this.adapter.exists(vaultPath)) {
+                    await this.adapter.remove(vaultPath);
+                }
+                this.manifest.delete(relativePath);
+                continue;
+            }
+            const data = this.fs.readFile(memPath);
+            await this.ensureVaultDir(parentOf(vaultPath));
+            await this.adapter.writeBinary(vaultPath, toArrayBuffer(data));
+            const stat = await this.adapter.stat(vaultPath);
+            const newMeta: FileMeta = {
+                mtime: stat?.mtime ?? Date.now(),
+                size: data.byteLength,
+            };
+            this.fs.utime(memPath, newMeta.mtime, newMeta.mtime);
+            this.manifest.set(relativePath, newMeta);
+        }
+    }
+
     private async walkVault(): Promise<{
         files: Map<string, FileMeta>;
         dirs: string[];
