@@ -200,6 +200,35 @@ describe("WasmGit.status", () => {
             "newdir/b.md",
         ]);
     });
+
+    it("does not copy unchanged or untracked files into memory", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, ".gitignore"), "*.bin\n");
+        writeFileSync(
+            path.join(vault.dir, "ignored.bin"),
+            Buffer.alloc(1024, 7)
+        );
+        writeFileSync(
+            path.join(vault.dir, "untracked.bin"),
+            Buffer.alloc(2048, 9)
+        );
+        writeFileSync(path.join(vault.dir, "untracked.md"), "new\n");
+
+        const readBinary = vi.spyOn(vault.adapter, "readBinary");
+        const status = await vault.manager.status();
+
+        const worktreeReads = readBinary.mock.calls
+            .map((call) => call[0])
+            .filter((filePath) => !String(filePath).startsWith(".git"));
+        expect(status.changed.map((file) => file.path).sort()).toEqual([
+            ".gitignore",
+            "untracked.md",
+        ]);
+        expect(worktreeReads).not.toContain("note.md");
+        expect(worktreeReads).not.toContain("ignored.bin");
+        expect(worktreeReads).not.toContain("untracked.bin");
+    });
 });
 
 describe("WasmGit staging", () => {

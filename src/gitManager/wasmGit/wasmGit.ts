@@ -16,6 +16,8 @@ import { splitRemoteBranch } from "../../utils";
 import { GitManager } from "../gitManager";
 import { HttpStatusError, WasmGitHttpBridge } from "./httpBridge";
 import { Lg2 } from "./lg2";
+import { GitIgnore } from "./gitIgnore";
+import { parseGitIndex } from "./gitIndex";
 import type { ParsedCommitObject } from "./parsers";
 import {
     applyUnifiedPatch,
@@ -28,7 +30,6 @@ import {
     parseLsRemote,
     parseNameStatus,
     parseRemoteVerbose,
-    parseStatus,
     removeConfigKey,
     resolveConflictMarkers,
     splitCommandLine,
@@ -36,6 +37,14 @@ import {
 } from "./parsers";
 import type { MirrorAdapter } from "./vaultMirror";
 import { VaultMirror } from "./vaultMirror";
+import {
+    collapseUntrackedDirectories,
+    collectUntracked,
+    composeStatus,
+    diffWorktreeAgainstIndex,
+    hashGitBlob,
+    walkWorktreeMeta,
+} from "./worktreeStatus";
 
 const MEM_ROOT = "/repo";
 const MEM_GITDIR = `${MEM_ROOT}/.git`;
@@ -52,6 +61,8 @@ const PATH_BATCH_SIZE = 50;
  * tree and the `.git` directory are persisted back to the vault after
  * mutating operations. Operations that only inspect repository state go
  * through {@link readGitDir} and skip the working-tree sync entirely.
+ * `status` walks vault metadata and hashes only files that might have
+ * changed, so it never copies the whole vault into memory.
  * Commands are serialized through {@link Lg2}'s mutex on the plugin thread
  * because Obsidian's adapter and `requestUrl` are main-thread APIs.
  * Remote access goes through {@link WasmGitHttpBridge} on top of Obsidian's
@@ -89,24 +100,30 @@ export class WasmGit extends GitManager {
         );
     }
 
-    private buildMirrors(): void {
-        const basePath = this.plugin.settings.basePath;
+    private isExcludedWorktreePath(relativePath: string): boolean {
         const gitDirVaultPath = this.getGitDirVaultPath();
+        const basePath = this.plugin.settings.basePath;
         const gitDirInsideWorktree =
             basePath === ""
                 ? gitDirVaultPath
-                : gitDirVaultPath.startsWith(basePath + "/")
+                : gitDirVaultPath.startsWith(`${basePath}/`)
                   ? gitDirVaultPath.substring(basePath.length + 1)
                   : undefined;
+        return (
+            gitDirInsideWorktree != undefined &&
+            (relativePath === gitDirInsideWorktree ||
+                relativePath.startsWith(`${gitDirInsideWorktree}/`))
+        );
+    }
+
+    private buildMirrors(): void {
+        const gitDirVaultPath = this.getGitDirVaultPath();
         this.worktreeMirror = new VaultMirror(
             this.adapter,
             this.lg2.fs,
-            basePath,
+            this.plugin.settings.basePath,
             MEM_ROOT,
-            (relativePath) =>
-                gitDirInsideWorktree != undefined &&
-                (relativePath === gitDirInsideWorktree ||
-                    relativePath.startsWith(gitDirInsideWorktree + "/"))
+            (relativePath) => this.isExcludedWorktreePath(relativePath)
         );
         this.gitDirMirror = new VaultMirror(
             this.adapter,
@@ -165,15 +182,6 @@ export class WasmGit extends GitManager {
         await this.gitDirMirror!.syncOut();
     }
 
-    /** Runs a read-only command against the current vault state. */
-    private async read(
-        args: string[],
-        opts?: { ignoreErrors?: boolean }
-    ): Promise<{ stdout: string; stderr: string }> {
-        await this.syncIn();
-        return this.lg2.run(MEM_ROOT, args, opts);
-    }
-
     /**
      * Runs a read-only command that only inspects the repository state in
      * `.git` (refs, history, index, and object contents) and never the
@@ -203,13 +211,28 @@ export class WasmGit extends GitManager {
         opts?: {
             ignoreErrors?: boolean;
             onProgress?: (line: string) => void;
+            /**
+             * `"none"` skips the working-tree mirror: the command only
+             * reads or writes `.git` (commit, reset --soft, push, fetch,
+             * remotes, tags). Default `"all"` keeps the previous full
+             * sync for commands that rewrite many worktree files.
+             */
+            worktree?: "all" | "none";
         }
     ): Promise<{ stdout: string; stderr: string }> {
-        await this.syncIn();
+        if (opts?.worktree === "none") {
+            await this.ensureReady();
+        } else {
+            await this.syncIn();
+        }
         try {
             return await this.lg2.run(MEM_ROOT, args, opts);
         } finally {
-            await this.syncOut();
+            if (opts?.worktree === "none") {
+                await this.gitDirMirror!.syncOut();
+            } else {
+                await this.syncOut();
+            }
         }
     }
 
@@ -258,42 +281,109 @@ export class WasmGit extends GitManager {
             );
         }, 20000);
         try {
-            const result = await this.read(["status", "-s", "-b", "-uall"]);
-            const parsed = parseStatus(result.stdout);
-
-            const all: FileStatusResult[] = [];
-            const changed: FileStatusResult[] = [];
-            const staged: FileStatusResult[] = [];
-            for (const file of parsed.files) {
-                if (
-                    opts?.path != undefined &&
-                    !file.path.startsWith(`${opts.path}/`) &&
-                    file.path !== opts.path
-                ) {
-                    continue;
-                }
-                const entry: FileStatusResult = {
-                    index: file.index === "?" ? "U" : file.index,
-                    workingDir: file.workingDir === "?" ? "U" : file.workingDir,
-                    path: file.path,
-                    from: file.from,
-                    vaultPath: this.getRelativeVaultPath(file.path),
-                };
-                if (entry.workingDir !== " ") changed.push(entry);
-                if (entry.index !== " " && entry.index !== "U")
-                    staged.push(entry);
-                if (entry.index !== " " || entry.workingDir !== " ")
-                    all.push(entry);
-            }
+            const status = await this.computeStatus(opts?.path);
             window.clearTimeout(timeout);
             notice?.hide();
-            return { all, changed, staged, conflicted: parsed.conflicted };
+            return status;
         } catch (error) {
             window.clearTimeout(timeout);
             notice?.hide();
             this.plugin.displayError(error);
             throw error;
         }
+    }
+
+    /**
+     * Builds a {@link Status} from the git index, vault metadata, and
+     * per-file hashes of the files that might have changed. The working
+     * tree is never copied into MEMFS, so this stays bounded by the `.git`
+     * directory plus one file at a time — the difference between a usable
+     * plugin and an iOS jetsam kill on launch.
+     */
+    private async computeStatus(pathFilter?: string): Promise<Status> {
+        await this.ensureReady();
+        const indexEntries = this.readIndexEntries();
+        const index = new Map(
+            indexEntries
+                .filter((entry) => entry.stage === 0)
+                .map((entry) => [entry.path, entry])
+        );
+        const conflicted = [
+            ...new Set(
+                indexEntries
+                    .filter((entry) => entry.stage > 0)
+                    .map((entry) => entry.path)
+            ),
+        ];
+
+        const ignore = new GitIgnore();
+        const excludePath = `${MEM_GITDIR}/info/exclude`;
+        if (this.lg2.fs.analyzePath(excludePath).exists) {
+            ignore.addFile(
+                "",
+                this.lg2.fs.readFile(excludePath, { encoding: "utf8" })
+            );
+        }
+
+        const trackedDirs = new Set<string>();
+        for (const repoPath of index.keys()) {
+            const parts = repoPath.split("/");
+            for (let i = 1; i < parts.length; i++) {
+                trackedDirs.add(parts.slice(0, i).join("/"));
+            }
+        }
+
+        const vaultFiles = await walkWorktreeMeta(
+            this.adapter,
+            this.plugin.settings.basePath,
+            {
+                exclude: (relativePath) =>
+                    this.isExcludedWorktreePath(relativePath),
+                ignore,
+                keep: (relativePath) =>
+                    index.has(relativePath) || trackedDirs.has(relativePath),
+                readText: (vaultPath) => this.readVaultText(vaultPath),
+            }
+        );
+
+        const { modified, deleted } = await diffWorktreeAgainstIndex({
+            index,
+            vaultFiles,
+            hashFile: (repoPath) => this.hashVaultFile(repoPath),
+        });
+        const untracked = collectUntracked(vaultFiles, index);
+
+        const cached = await this.readGitDir(
+            ["diff", "--name-status", "--cached"],
+            { ignoreErrors: true }
+        );
+        return composeStatus({
+            staged: parseNameStatus(cached.stdout),
+            modified,
+            deleted,
+            untracked,
+            conflicted,
+            toVaultPath: (repoPath) => this.getRelativeVaultPath(repoPath),
+            pathFilter,
+        });
+    }
+
+    private readIndexEntries() {
+        const indexPath = `${MEM_GITDIR}/index`;
+        if (!this.lg2.fs.analyzePath(indexPath).exists) return [];
+        return parseGitIndex(this.lg2.fs.readFile(indexPath));
+    }
+
+    private async readVaultText(vaultPath: string): Promise<string> {
+        const data = new Uint8Array(await this.adapter.readBinary(vaultPath));
+        return new TextDecoder("utf-8").decode(data);
+    }
+
+    private async hashVaultFile(repoPath: string): Promise<string> {
+        const data = new Uint8Array(
+            await this.adapter.readBinary(this.getRelativeVaultPath(repoPath))
+        );
+        return hashGitBlob(data);
     }
 
     async getStagedFiles(
@@ -327,22 +417,22 @@ export class WasmGit extends GitManager {
         path?: string;
         status?: Status;
     }): Promise<string[]> {
-        // Deliberately without -uall: directories that only contain
-        // untracked files are collapsed to `dir/`, matching native git and
-        // allowing efficient recursive deletion.
-        const result = await this.read(["status", "-s"]);
-        const untracked: string[] = [];
-        for (const file of parseStatus(result.stdout).files) {
-            if (file.index !== "?" || file.workingDir !== "?") continue;
-            if (
-                opts?.path != undefined &&
-                !file.path.startsWith(`${opts.path}/`)
-            ) {
-                continue;
-            }
-            untracked.push(file.path);
-        }
-        return untracked;
+        // Deliberately without listing every file: directories that only
+        // contain untracked files are collapsed to `dir/`, matching native
+        // git and allowing efficient recursive deletion.
+        const status = opts?.status ?? (await this.computeStatus(opts?.path));
+        await this.ensureReady();
+        const untracked = status.changed
+            .filter((file) => file.workingDir === "U" && file.index === "U")
+            .map((file) => file.path)
+            .filter(
+                (path) =>
+                    opts?.path == undefined || path.startsWith(`${opts.path}/`)
+            );
+        const tracked = this.readIndexEntries()
+            .filter((entry) => entry.stage === 0)
+            .map((entry) => entry.path);
+        return collapseUntrackedDirectories(untracked, tracked);
     }
 
     // ------------------------------------------------------------------
@@ -354,7 +444,7 @@ export class WasmGit extends GitManager {
             const gitPath = this.getRelativeRepoPath(filepath, relativeToVault);
             // lg2's `add` uses git_index_add_all and therefore also stages
             // deletions, like `git add -A`.
-            await this.mutate(["add", gitPath]);
+            await this.addPaths([gitPath]);
         } catch (error) {
             this.plugin.displayError(error);
             throw error;
@@ -369,14 +459,15 @@ export class WasmGit extends GitManager {
         status?: Status;
     }): Promise<void> {
         try {
-            if (status) {
-                const paths = status.changed.map((file) => file.path);
-                await this.addPaths(paths);
-            } else if (dir != undefined && dir !== ".") {
-                await this.mutate(["add", `${dir}/*`, dir]);
-            } else {
-                await this.mutate(["add", "."]);
-            }
+            // Always add explicit paths so we never run `add .` against a
+            // partial in-memory worktree (that would stage every tracked
+            // file as deleted).
+            const current =
+                status ??
+                (await this.status(
+                    dir == undefined || dir === "." ? undefined : { path: dir }
+                ));
+            await this.addPaths(current.changed.map((file) => file.path));
         } catch (error) {
             this.plugin.displayError(error);
             throw error;
@@ -384,12 +475,15 @@ export class WasmGit extends GitManager {
     }
 
     private async addPaths(paths: string[]): Promise<void> {
+        if (paths.length === 0) return;
+        await this.ensureReady();
         for (let i = 0; i < paths.length; i += PATH_BATCH_SIZE) {
             const batch = paths.slice(i, i + PATH_BATCH_SIZE);
-            if (batch.length > 0) {
-                await this.mutate(["add", ...batch]);
-            }
+            if (batch.length === 0) continue;
+            await this.worktreeMirror!.importFiles(batch);
+            await this.lg2.run(MEM_ROOT, ["add", ...batch]);
         }
+        await this.gitDirMirror!.syncOut();
     }
 
     async unstage(filepath: string, relativeToVault: boolean): Promise<void> {
@@ -441,7 +535,7 @@ export class WasmGit extends GitManager {
 
     private async resetIndexToHead(): Promise<void> {
         if (await this.headExists()) {
-            await this.mutate(["reset", "HEAD"]);
+            await this.mutate(["reset", "HEAD"], { worktree: "none" });
         } else {
             // Unborn HEAD: there is no commit to reset to, so clearing the
             // index file empties the staging area instead.
@@ -463,7 +557,10 @@ export class WasmGit extends GitManager {
 
     async discard(filepath: string): Promise<void> {
         try {
-            await this.mutate(["checkout", "--", filepath]);
+            await this.ensureReady();
+            await this.lg2.run(MEM_ROOT, ["checkout", "--", filepath]);
+            await this.worktreeMirror!.exportFiles([filepath]);
+            await this.gitDirMirror!.syncOut();
         } catch (error) {
             this.plugin.displayError(error);
             throw error;
@@ -486,12 +583,14 @@ export class WasmGit extends GitManager {
                         (dir == undefined || file.path.startsWith(dir))
                 )
                 .map((file) => file.path);
+            await this.ensureReady();
             for (let i = 0; i < files.length; i += PATH_BATCH_SIZE) {
                 const batch = files.slice(i, i + PATH_BATCH_SIZE);
-                if (batch.length > 0) {
-                    await this.mutate(["checkout", "--", ...batch]);
-                }
+                if (batch.length === 0) continue;
+                await this.lg2.run(MEM_ROOT, ["checkout", "--", ...batch]);
+                await this.worktreeMirror!.exportFiles(batch);
             }
+            await this.gitDirMirror!.syncOut();
         } catch (error) {
             this.plugin.displayError(error);
             throw error;
@@ -551,9 +650,13 @@ export class WasmGit extends GitManager {
                             "Amending the initial commit is not supported with the wasm-git engine."
                         );
                     }
-                    await this.mutate(["reset", "--soft", "HEAD~1"]);
+                    await this.mutate(["reset", "--soft", "HEAD~1"], {
+                        worktree: "none",
+                    });
                 }
-                await this.mutate(["commit", "-m", formattedMessage]);
+                await this.mutate(["commit", "-m", formattedMessage], {
+                    worktree: "none",
+                });
                 if (mergeInProgress) {
                     this.plugin.localStorage.setConflict(false);
                 }
@@ -675,12 +778,12 @@ export class WasmGit extends GitManager {
                 this.lg2.fs.writeFile(memPath, resolved);
             }
             if (unresolved.length === 0) {
+                await this.worktreeMirror!.exportFiles(conflicted);
                 await this.addPaths(conflicted);
-                await this.mutate([
-                    "commit",
-                    "-m",
-                    `Merge branch '${branchInfo.tracking}'`,
-                ]);
+                await this.mutate(
+                    ["commit", "-m", `Merge branch '${branchInfo.tracking}'`],
+                    { worktree: "none" }
+                );
                 return;
             }
         }
@@ -724,7 +827,9 @@ export class WasmGit extends GitManager {
                         ).length;
                     }
                 }
-                await this.withAuthRetry(() => this.mutate(["push"]));
+                await this.withAuthRetry(() =>
+                    this.mutate(["push"], { worktree: "none" })
+                );
                 if (branchInfo.current && !branchInfo.tracking) {
                     // lg2's push always pushes the current branch to the
                     // same-named branch on origin; record that as upstream.
@@ -768,6 +873,7 @@ export class WasmGit extends GitManager {
         const remoteName = remote ?? (await this.getCurrentRemote());
         await this.withAuthRetry(() =>
             this.mutate(["fetch", remoteName], {
+                worktree: "none",
                 onProgress: (line) => {
                     if (
                         progressNotice &&
@@ -882,7 +988,7 @@ export class WasmGit extends GitManager {
 
     async createBranch(branch: string): Promise<void> {
         try {
-            await this.mutate(["checkout", "-b", branch]);
+            await this.mutate(["checkout", "-b", branch], { worktree: "none" });
         } catch (error) {
             this.plugin.displayError(error);
             throw error;
@@ -941,7 +1047,7 @@ export class WasmGit extends GitManager {
     async init(): Promise<void> {
         try {
             await this.ensureReady();
-            await this.mutate(["init", "."]);
+            await this.mutate(["init", "."], { worktree: "none" });
             this.gitDirLoaded = true;
         } catch (error) {
             this.plugin.displayError(error);
@@ -1034,7 +1140,9 @@ export class WasmGit extends GitManager {
                     await this.syncOut();
                 }
             } else {
-                await this.mutate(["config", path, String(value)]);
+                await this.mutate(["config", path, String(value)], {
+                    worktree: "none",
+                });
             }
         } catch (error) {
             this.plugin.displayError(error);
@@ -1058,9 +1166,13 @@ export class WasmGit extends GitManager {
         try {
             const remotes = await this.getRemotes();
             if (remotes.includes(name)) {
-                await this.mutate(["remote", "set-url", name, url]);
+                await this.mutate(["remote", "set-url", name, url], {
+                    worktree: "none",
+                });
             } else {
-                await this.mutate(["remote", "add", name, url]);
+                await this.mutate(["remote", "add", name, url], {
+                    worktree: "none",
+                });
             }
         } catch (error) {
             this.plugin.displayError(error);
@@ -1083,7 +1195,9 @@ export class WasmGit extends GitManager {
     }
 
     async removeRemote(remoteName: string): Promise<void> {
-        await this.mutate(["remote", "remove", remoteName]);
+        await this.mutate(["remote", "remove", remoteName], {
+            worktree: "none",
+        });
     }
 
     async getRemoteBranches(remote: string): Promise<string[]> {
@@ -1133,7 +1247,9 @@ export class WasmGit extends GitManager {
             `branch.${branchInfo.current}.merge`,
             `refs/heads/${branch ?? branchInfo.current}`
         );
-        await this.withAuthRetry(() => this.mutate(["push"]));
+        await this.withAuthRetry(() =>
+            this.mutate(["push"], { worktree: "none" })
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1230,13 +1346,20 @@ export class WasmGit extends GitManager {
             );
             return buildAddedFilePatch(filePath, content.stdout);
         }
-        // Staged changes compare the index against HEAD; only the unstaged
-        // diff needs the working tree mirrored in.
-        const result = stagedChanges
-            ? await this.readGitDir(["diff", "--cached"], {
-                  ignoreErrors: true,
-              })
-            : await this.read(["diff"], { ignoreErrors: true });
+        if (stagedChanges) {
+            const result = await this.readGitDir(["diff", "--cached"], {
+                ignoreErrors: true,
+            });
+            return extractFileDiff(result.stdout, filePath) ?? "";
+        }
+        await this.ensureReady();
+        await this.worktreeMirror!.importFiles([filePath]);
+        // Path-limited `diff` is not reliable on lg2; import only this file
+        // and extract its hunk from the full diff. Missing tracked files
+        // show as deletions and are ignored by extractFileDiff.
+        const result = await this.lg2.run(MEM_ROOT, ["diff"], {
+            ignoreErrors: true,
+        });
         return extractFileDiff(result.stdout, filePath) ?? "";
     }
 
@@ -1317,12 +1440,12 @@ export class WasmGit extends GitManager {
     /** Creates a (lightweight or annotated) tag at HEAD. */
     async tagCreate(name: string, message?: string): Promise<void> {
         const args = message ? ["tag", name, message] : ["tag", name];
-        await this.mutate(args);
+        await this.mutate(args, { worktree: "none" });
     }
 
     /** Deletes a tag. */
     async tagDelete(name: string): Promise<void> {
-        await this.mutate(["tag", "-d", name]);
+        await this.mutate(["tag", "-d", name], { worktree: "none" });
     }
 
     /** Lists all tag names. */
@@ -1348,7 +1471,9 @@ export class WasmGit extends GitManager {
     ): Promise<Blame | "untracked"> {
         const repoPath = this.getRelativeRepoPath(filePath);
         if (!(await this.isTracked(repoPath))) return "untracked";
-        const result = await this.read(["blame", repoPath]);
+        await this.ensureReady();
+        await this.worktreeMirror!.importFiles([repoPath]);
+        const result = await this.lg2.run(MEM_ROOT, ["blame", repoPath]);
         const lines = parseBlame(result.stdout);
         const commits = new Map<string, ParsedCommitObject>();
         const fullHashes = new Map<string, string>();
@@ -1370,7 +1495,9 @@ export class WasmGit extends GitManager {
 
     async hashObject(filepath: string): Promise<string> {
         const repoPath = this.getRelativeRepoPath(filepath);
-        const hashed = await this.read(["hash-object", repoPath], {
+        await this.ensureReady();
+        await this.worktreeMirror!.importFiles([repoPath]);
+        const hashed = await this.lg2.run(MEM_ROOT, ["hash-object", repoPath], {
             ignoreErrors: true,
         });
         const hash = hashed.stdout.match(/^[0-9a-f]{40}$/m)?.[0];
@@ -1492,8 +1619,12 @@ export class WasmGit extends GitManager {
         const previous = await this.catFileCommit(oldHead);
         if (!previous) return;
         await this.withGitOperation(GitOperation.commit, async () => {
-            await this.mutate(["reset", "--soft", tracking]);
-            await this.mutate(["commit", "-m", previous.message.trim()]);
+            await this.mutate(["reset", "--soft", tracking], {
+                worktree: "none",
+            });
+            await this.mutate(["commit", "-m", previous.message.trim()], {
+                worktree: "none",
+            });
             this.app.workspace.trigger("obsidian-git:head-change");
         });
     }
