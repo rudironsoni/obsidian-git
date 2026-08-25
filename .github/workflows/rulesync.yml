@@ -1,0 +1,223 @@
+name: rulesync
+
+on:
+    workflow_dispatch:
+    pull_request:
+    push:
+        branches:
+            - master
+            - main
+
+permissions:
+    contents: write
+    pull-requests: read
+
+concurrency:
+    group: rulesync-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    generate:
+        name: Generate agent harness
+        if: >
+            github.actor != 'github-actions[bot]' &&
+            (
+              github.event_name == 'workflow_dispatch' ||
+              github.event_name == 'push' ||
+              (
+                github.event_name == 'pull_request' &&
+                github.event.pull_request.head.repo.full_name == github.repository
+              )
+            )
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+              with:
+                  ref: ${{ github.head_ref || github.ref_name }}
+                  fetch-depth: 0
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Install
+              run: pnpm install --frozen-lockfile
+
+            - name: Detect Rulesync source changes
+              id: source
+              run: |
+                  set -euo pipefail
+                  if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                      echo "changed=true" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+                  if [ "${{ github.event_name }}" = "push" ]; then
+                      base="${{ github.event.before }}"
+                      if [ "$base" = "0000000000000000000000000000000000000000" ]; then
+                          echo "changed=true" >> "$GITHUB_OUTPUT"
+                          exit 0
+                      fi
+                      if git diff --name-only "$base" HEAD | grep -Eq '^(\.rulesync/|rulesync\.jsonc|rulesync\.lock)'; then
+                          echo "changed=true" >> "$GITHUB_OUTPUT"
+                      else
+                          echo "changed=false" >> "$GITHUB_OUTPUT"
+                      fi
+                      exit 0
+                  fi
+                  git fetch origin "${{ github.base_ref }}" --depth=1
+                  if git diff --name-only "origin/${{ github.base_ref }}"...HEAD | grep -Eq '^(\.rulesync/|rulesync\.jsonc|rulesync\.lock)'; then
+                      echo "changed=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "changed=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Install remote Rulesync sources
+              if: steps.source.outputs.changed == 'true'
+              run: pnpm run rulesync:install
+
+            - name: Generate
+              if: steps.source.outputs.changed == 'true'
+              run: pnpm run rulesync:generate
+
+            - name: Assert Cursor Cloud environment.json survived
+              if: steps.source.outputs.changed == 'true'
+              run: |
+                  set -euo pipefail
+                  test -f .cursor/environment.json
+                  grep -q '"install": "bash scripts/cursor-cloud-install.sh"' .cursor/environment.json
+
+            - name: Commit generated files
+              if: steps.source.outputs.changed == 'true'
+              run: |
+                  set -euo pipefail
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  mapfile -t paths < <(python3 scripts/rulesync-generated-paths.py)
+                  if [ "${#paths[@]}" -eq 0 ]; then
+                      echo "No generated paths found."
+                      exit 0
+                  fi
+                  git add -- "${paths[@]}"
+                  if git diff --cached --quiet; then
+                      echo "No generated file changes."
+                      exit 0
+                  fi
+                  git commit -m "chore(rulesync): generate agent harness"
+                  git push origin HEAD
+
+    check:
+        name: Check generated harness
+        needs: generate
+        if: always() && (needs.generate.result == 'success' || needs.generate.result == 'skipped')
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+              with:
+                  ref: ${{ github.head_ref || github.ref_name }}
+                  fetch-depth: 0
+                  repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Install
+              run: pnpm install --frozen-lockfile
+
+            - name: Install remote Rulesync sources
+              run: pnpm run rulesync:install
+
+            - name: Reject generated-file edits without Rulesync source changes
+              if: github.event_name == 'pull_request'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  PR_NUMBER="${{ github.event.pull_request.number }}"
+                  mapfile -t changed < <(gh pr diff "$PR_NUMBER" --name-only)
+                  python3 - "${changed[@]}" <<'PY'
+                  import sys
+
+                  changed = sys.argv[1:]
+                  generated_exact = {
+                      "AGENTS.md",
+                      "CLAUDE.md",
+                      "GEMINI.md",
+                      "QWEN.md",
+                      "kilo.jsonc",
+                      "opencode.jsonc",
+                      ".mcp.json",
+                      ".rules",
+                      ".aiignore",
+                      ".cursorignore",
+                      ".geminiignore",
+                      ".github/copilot-instructions.md",
+                  }
+                  generated_dirs = (
+                      ".cursor/",
+                      ".claude/",
+                      ".codex/",
+                      ".agent/",
+                      ".agents/",
+                      ".copilot/",
+                      ".opencode/",
+                      ".github/agents/",
+                      ".github/skills/",
+                      ".github/prompts/",
+                      ".github/hooks/",
+                  )
+                  source_prefixes = (".rulesync/", "rulesync.jsonc", "rulesync.lock")
+                  allowed = {".cursor/environment.json"}
+
+                  def is_generated(path: str) -> bool:
+                      if path in allowed:
+                          return False
+                      if path in generated_exact:
+                          return True
+                      return any(path.startswith(prefix) for prefix in generated_dirs)
+
+                  def is_source(path: str) -> bool:
+                      return any(
+                          path == prefix.rstrip("/") or path.startswith(prefix)
+                          for prefix in source_prefixes
+                      )
+
+                  generated = [path for path in changed if is_generated(path)]
+                  source_changed = any(is_source(path) for path in changed)
+                  if not generated:
+                      print("No generated-path edits in this PR.")
+                      raise SystemExit(0)
+                  if source_changed:
+                      print(
+                          "Generated files changed with .rulesync source; "
+                          "content is validated by rulesync generate --check."
+                      )
+                      raise SystemExit(0)
+                  print("Generated agent files were edited without a .rulesync change:")
+                  for path in generated:
+                      print(f"  {path}")
+                  print("Edit .rulesync/ instead. CI is the only writer of generate output.")
+                  raise SystemExit(1)
+                  PY
+
+            - name: Check generated files are up to date
+              run: pnpm run rulesync:check
+
+            - name: Assert Cursor Cloud environment.json survived
+              run: |
+                  set -euo pipefail
+                  test -f .cursor/environment.json
+                  grep -q '"install": "bash scripts/cursor-cloud-install.sh"' .cursor/environment.json
