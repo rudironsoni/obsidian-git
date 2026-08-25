@@ -4,29 +4,11 @@ import type { GitIgnore } from "./gitIgnore";
 import type { ParsedNameStatusEntry } from "./parsers";
 import type { MirrorAdapter } from "./vaultMirror";
 
+export { hashGitBlob } from "./gitObject";
+
 export interface VaultFileMeta {
     size: number;
     mtimeMs: number;
-}
-
-/**
- * SHA-1 of a git blob (`blob <size>\\0` + content), matching `git hash-object`.
- */
-export async function hashGitBlob(data: Uint8Array): Promise<string> {
-    const header = new TextEncoder().encode(`blob ${data.byteLength}\0`);
-    const payload = new Uint8Array(header.byteLength + data.byteLength);
-    payload.set(header, 0);
-    payload.set(data, header.byteLength);
-    const digest = await globalThis.crypto.subtle.digest("SHA-1", payload);
-    return toHex(new Uint8Array(digest));
-}
-
-function toHex(bytes: Uint8Array): string {
-    let hex = "";
-    for (let i = 0; i < bytes.length; i++) {
-        hex += bytes[i]!.toString(16).padStart(2, "0");
-    }
-    return hex;
 }
 
 /**

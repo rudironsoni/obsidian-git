@@ -364,6 +364,37 @@ export function parseCommitObject(
     return result;
 }
 
+export interface ParsedLsTreeEntry {
+    mode: number;
+    type: "blob" | "tree" | "commit";
+    hash: string;
+    path: string;
+}
+
+const LS_TREE_LINE = /^([0-7]{5,7}) (blob|tree|commit) ([0-9a-f]{40})\t(.*)$/;
+
+/**
+ * Parses `ls-tree` / `cat-file -p <tree>` listing lines. Binary names and
+ * `-z` records are not handled; vault paths are UTF-8.
+ */
+export function parseLsTree(output: string): ParsedLsTreeEntry[] {
+    const entries: ParsedLsTreeEntry[] = [];
+    for (const line of output.split("\n")) {
+        if (line === "") continue;
+        const match = line.match(LS_TREE_LINE);
+        if (!match) continue;
+        const type = match[2];
+        if (type !== "blob" && type !== "tree" && type !== "commit") continue;
+        entries.push({
+            mode: Number.parseInt(match[1]!, 8),
+            type,
+            hash: match[3]!,
+            path: match[4]!,
+        });
+    }
+    return entries;
+}
+
 /**
  * Extracts the section of a unified diff belonging to one file from a
  * whole-repository patch, since lg2's `diff` command does not accept a
