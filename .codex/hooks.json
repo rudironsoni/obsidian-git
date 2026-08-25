@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'obsidian-git harness active | WasmGit + Vitest | edit .rulesync only'"
+            "command": "echo 'obsidian-git harness active | Vitest + WDIO | edit .rulesync only'"
           }
         ]
       }

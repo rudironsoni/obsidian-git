@@ -10,6 +10,11 @@ yarn.lock
 # build
 *.js.map
 
+# WDIO / Obsidian launcher cache and vault git created at E2E runtime
+.obsidian-cache
+e2e/vaults/**/.git
+obsidian-versions-lock.txt
+
 .prettierignore
 /data.json
 

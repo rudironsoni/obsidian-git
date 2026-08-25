@@ -1,6 +1,9 @@
 allowBuilds:
   '@parcel/watcher': false
+  classic-level: true
+  edgedriver: false
   esbuild: true
+  geckodriver: false
   svelte-preprocess: true
   tldjs: false
 minimumReleaseAgeExclude:

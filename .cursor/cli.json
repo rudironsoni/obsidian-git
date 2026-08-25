@@ -17,7 +17,9 @@
       "Shell(pnpm run rulesync:generate)",
       "Shell(pnpm run svelte)",
       "Shell(pnpm run test)",
-      "Shell(pnpm run tsc)"
+      "Shell(pnpm run test:e2e)",
+      "Shell(pnpm run tsc)",
+      "Shell(pnpm run wdio:mcp)"
     ]
   }
 }

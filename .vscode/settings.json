@@ -6,6 +6,8 @@
     "pnpm run lint": true,
     "pnpm run format": true,
     "pnpm run test": true,
+    "pnpm run test:e2e": true,
+    "pnpm run wdio:mcp": true,
     "pnpm run build": true,
     "pnpm run all": true,
     "pnpm run rulesync:check": true,

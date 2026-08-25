@@ -1,4 +1,10 @@
 {
     "$schema": "https://github.com/dyoshikawa/rulesync/releases/latest/download/mcp-schema.json",
-    "mcpServers": {}
+    "mcpServers": {
+        "wdio": {
+            "description": "WebdriverIO MCP for diagnosing a live WDIO session (logs, DOM, network). Use after pnpm run test:e2e or pnpm run wdio:mcp. Complements E2E specs; does not replace them. Do not add vault-note MCP servers here.",
+            "command": "npx",
+            "args": ["-y", "@wdio/mcp"]
+        }
+    }
 }
