@@ -1,0 +1,60 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(credentials/)"
+    ],
+    "allow": [
+      "Bash(* && echo \"EXIT:$?\")",
+      "Bash(* && echo EXIT:*)",
+      "Bash(* &&echo EXIT:*)",
+      "Bash(*; echo \"EXIT:$?\")",
+      "Bash(*; echo EXIT:*)",
+      "Bash(*;echo EXIT:*)",
+      "Bash(echo EXIT:*)",
+      "Bash(pnpm install)",
+      "Bash(pnpm run all)",
+      "Bash(pnpm run build)",
+      "Bash(pnpm run format)",
+      "Bash(pnpm run lint)",
+      "Bash(pnpm run rulesync:check)",
+      "Bash(pnpm run rulesync:generate)",
+      "Bash(pnpm run svelte)",
+      "Bash(pnpm run test)",
+      "Bash(pnpm run tsc)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'obsidian-git harness active | WasmGit + Vitest | edit .rulesync only'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "git diff --name-only | grep '\\.ts$' >/dev/null && pnpm run tsc || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Executing bash command. Do not edit generated agent files; change .rulesync/ instead.'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,3 +1,7 @@
+---
+globs: **/*
+---
+
 # Agent harness source of truth
 
 Edit `.rulesync/` (and `rulesync.jsonc`) only. Generated files such as
