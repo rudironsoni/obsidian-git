@@ -198,7 +198,7 @@ describe("writeGitIndex", () => {
     });
 
     it("writes and re-parses paths longer than 0xFFF bytes", async () => {
-        const longPath = `${"dir/".repeat(200)}note.md`;
+        const longPath = `${"a".repeat(0x1000)}/note.md`;
         expect(new TextEncoder().encode(longPath).byteLength).toBeGreaterThan(
             0x0fff
         );

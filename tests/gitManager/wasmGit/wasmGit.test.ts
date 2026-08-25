@@ -363,11 +363,19 @@ describe("WasmGit staging", () => {
         await vault.manager.stage("data.bin", true);
         await vault.manager.stage("café.md", true);
 
-        expect((await gitStaged(vault.dir)).sort()).toEqual([
-            "café.md",
-            "data.bin",
-            "empty.md",
-        ]);
+        const staged = (
+            await git(vault.dir, [
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--cached",
+                "--name-only",
+            ])
+        )
+            .split("\n")
+            .filter((line) => line !== "")
+            .sort();
+        expect(staged).toEqual(["café.md", "data.bin", "empty.md"]);
         expect(
             (await git(vault.dir, ["cat-file", "-p", ":empty.md"])).length
         ).toBe(0);
