@@ -21,7 +21,7 @@ targets:
 
 ## Do not
 
--   Hand-edit `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or generated trees under `.cursor/` (except `.cursor/environment.json`), `.claude/`, `.codex/`, `.agent/`, `.agents/`, `.copilot/`, `.opencode/`.
+-   Hand-edit `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or generated trees under `.cursor/` (except `.cursor/environment.json`), `.claude/`, `.codex/`, `.agent/`, `.agents/`, `.copilot/`, `.opencode/`, `.vscode/`.
 -   Run `rulesync gitignore` in a way that ignores `AGENTS.md`; generated files stay tracked.
 -   Overwrite `.cursor/environment.json` or `scripts/cursor-cloud-install.sh`.
 

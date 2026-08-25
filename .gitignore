@@ -18,7 +18,9 @@ obsidian-versions-lock.txt
 .prettierignore
 /data.json
 
-.vscode
+.vscode/*
+!.vscode/mcp.json
+!.vscode/settings.json
 
 .DS_Store
 scripts/__pycache__/

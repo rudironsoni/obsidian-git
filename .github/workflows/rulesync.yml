@@ -178,6 +178,7 @@ jobs:
                       ".github/skills/",
                       ".github/prompts/",
                       ".github/hooks/",
+                      ".vscode/",
                   )
                   source_prefixes = (".rulesync/", "rulesync.jsonc", "rulesync.lock")
                   allowed = {".cursor/environment.json"}

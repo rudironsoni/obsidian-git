@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "wdio": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@wdio/mcp"
+      ]
+    }
+  }
+}

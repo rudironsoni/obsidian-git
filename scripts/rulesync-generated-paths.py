@@ -33,6 +33,7 @@ DIRS = [
     ".github/skills",
     ".github/prompts",
     ".github/hooks",
+    ".vscode",
 ]
 
 
