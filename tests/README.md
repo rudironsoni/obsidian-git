@@ -136,21 +136,22 @@ loader applies.
 -   Do not overfit tests to incidental implementation details when Git can be used
     as an oracle.
 
-## Future Test Plans
+## E2E (WDIO)
 
-### Possible E2E Track
+Real Obsidian coverage uses `wdio-obsidian-service`. It is **not** part of
+`pnpm run test` or `pnpm run all`.
 
-A future optional E2E setup could use `wdio-obsidian-service`, similar to the
-Templater plugin.
+```bash
+pnpm run build
+pnpm run test:e2e
+```
 
-Potential E2E scenarios:
+-   Config: `wdio.conf.mts`
+-   Specs: `e2e/specs/*.e2e.ts`
+-   Vault fixture: `e2e/vaults/simple` (git-initialized in `onPrepare`)
+-   Linux CI: xvfb job in `.github/workflows/test.yml`
+-   Cursor Cloud: skip E2E (no display)
 
--   plugin loads in Obsidian
--   commands are registered
--   source control view opens
--   changed/staged files appear in the UI
--   stage, unstage, commit, and discard flows work from the UI
--   settings persist after reload
-
-This should be a separate command such as `pnpm run test:e2e`, not part of the
-default `pnpm run test`.
+Smoke specs cover plugin load, opening Source Control, and a changed file
+appearing in the view. Broader UI flows can be added as more specs, not as
+Vitest cases.
