@@ -1,0 +1,102 @@
+name: Plugin build
+
+# Builds and zips plugin artifacts. Release workflows call this; they never
+# re-bundle. PR CI keeps a lighter `pnpm run build` in test.yml.
+
+on:
+    workflow_call:
+        inputs:
+            version:
+                description: Plugin SemVer to stamp into manifests
+                type: string
+                required: true
+            sha:
+                description: Commit SHA to build
+                type: string
+                required: true
+        outputs:
+            zip_name:
+                description: Zip file name
+                value: ${{ jobs.build.outputs.zip_name }}
+    workflow_dispatch:
+        inputs:
+            version:
+                description: Plugin SemVer to stamp into manifests
+                type: string
+                required: true
+            sha:
+                description: Commit SHA to build (default: current SHA)
+                type: string
+                required: false
+
+env:
+    PLUGIN_NAME: obsidian-git
+
+permissions:
+    contents: read
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        outputs:
+            zip_name: ${{ steps.pack.outputs.zip_name }}
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  ref: ${{ inputs.sha || github.sha }}
+
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Stamp plugin version
+              env:
+                  VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  node -e '
+                  const fs = require("node:fs");
+                  const version = process.env.VERSION;
+                  if (!version) throw new Error("Missing VERSION");
+                  for (const file of ["package.json", "manifest.json"]) {
+                    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+                    data.version = version;
+                    fs.writeFileSync(file, `${JSON.stringify(data, null, 4)}\n`);
+                  }
+                  '
+
+            - name: Install
+              run: pnpm install
+
+            - name: Build
+              run: pnpm run build
+
+            - name: Pack
+              id: pack
+              env:
+                  VERSION: ${{ inputs.version }}
+              run: |
+                  set -euo pipefail
+                  mkdir "${{ env.PLUGIN_NAME }}"
+                  cp main.js manifest.json styles.css "${{ env.PLUGIN_NAME }}"
+                  zip_name="${{ env.PLUGIN_NAME }}-${VERSION}.zip"
+                  zip -r "${zip_name}" "${{ env.PLUGIN_NAME }}"
+                  echo "zip_name=${zip_name}" >> "${GITHUB_OUTPUT}"
+                  ls -la main.js manifest.json styles.css "${zip_name}"
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: plugin-dist
+                  if-no-files-found: error
+                  retention-days: 30
+                  path: |
+                      main.js
+                      manifest.json
+                      styles.css
+                      ${{ env.PLUGIN_NAME }}-${{ inputs.version }}.zip

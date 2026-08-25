@@ -1,10 +1,17 @@
-name: Build obsidian plugin
+name: Release
+
+# Cuts one stable plugin release. A push to master/main (including merge,
+# squash, and rebase of a PR) always bumps SemVer from the conventional
+# branch and any beta series it already published, then calls plugin-build.yml.
+# chore(release) / [skip release] commits do not loop.
 
 on:
+    push:
+        branches: [master, main]
     workflow_dispatch:
         inputs:
             bump:
-                description: Version bump
+                description: Version bump (none = infer from merged branch)
                 type: choice
                 options:
                     - none
@@ -17,28 +24,28 @@ on:
                 type: string
                 required: false
 
-env:
-    PLUGIN_NAME: obsidian-git
-
 concurrency:
     group: release
     cancel-in-progress: false
 
 permissions:
-    id-token: write
     contents: write
+    id-token: write
     attestations: write
+    actions: write
+
+env:
+    PLUGIN_NAME: obsidian-git
 
 jobs:
-    release:
+    prepare:
+        if: ${{ github.event_name != 'push' || (!contains(github.event.head_commit.message, 'chore(release)') && !contains(github.event.head_commit.message, '[skip release]')) }}
         runs-on: ubuntu-latest
+        timeout-minutes: 10
+        outputs:
+            version: ${{ steps.version.outputs.version }}
+            source_sha: ${{ github.sha }}
         steps:
-            - name: Require master
-              if: github.ref != 'refs/heads/master'
-              run: |
-                  echo "Releases must be created from master (got ${{ github.ref }})."
-                  exit 1
-
             - uses: actions/checkout@v7
               with:
                   fetch-depth: 0
@@ -56,113 +63,151 @@ jobs:
             - name: Install
               run: pnpm install
 
-            - name: Configure git
+            - name: Resolve merged branch
+              id: branch
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
-                  git config user.name "github-actions[bot]"
-                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  set -euo pipefail
+                  git fetch --tags --force
+                  branch=""
+                  pulls="$(gh api \
+                    -H "Accept: application/vnd.github+json" \
+                    "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                    || echo '[]')"
+                  branch="$(printf '%s' "${pulls}" | node -e '
+                    const chunks = [];
+                    process.stdin.on("data", (c) => chunks.push(c));
+                    process.stdin.on("end", () => {
+                      const text = Buffer.concat(chunks).toString("utf8").trim() || "[]";
+                      try {
+                        const data = JSON.parse(text);
+                        const ref = Array.isArray(data) ? data[0]?.head?.ref : "";
+                        process.stdout.write(typeof ref === "string" ? ref : "");
+                      } catch {
+                        process.stdout.write("");
+                      }
+                    });
+                  ')"
+                  echo "branch=${branch}" >> "${GITHUB_OUTPUT}"
+                  echo "Merged branch: ${branch:-"(none; default patch)"}"
 
             - name: Resolve version
               id: version
               env:
-                  INPUT_BUMP: ${{ inputs.bump }}
-                  INPUT_VERSION: ${{ inputs.version }}
-              run: |
-                  set -euo pipefail
+                  RELEASE_BRANCH: ${{ steps.branch.outputs.branch }}
+                  EXPLICIT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+                  EXPLICIT_BUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.bump || '' }}
+              run: pnpm exec tsx scripts/compute-release-version.ts
 
-                  if [ -n "${INPUT_VERSION}" ]; then
-                      pnpm exec standard-version --release-as "${INPUT_VERSION}"
-                      did_bump=true
-                  elif [ "${INPUT_BUMP}" != "none" ]; then
-                      pnpm exec standard-version --release-as "${INPUT_BUMP}"
-                      did_bump=true
-                  else
-                      did_bump=false
-                  fi
-
-                  version="$(node -p "require('./package.json').version")"
-                  manifest_version="$(node -p "require('./manifest.json').version")"
-                  if [ "${version}" != "${manifest_version}" ]; then
-                      echo "package.json (${version}) and manifest.json (${manifest_version}) versions do not match."
-                      exit 1
-                  fi
-
-                  echo "version=${version}" >> "${GITHUB_OUTPUT}"
-                  echo "did_bump=${did_bump}" >> "${GITHUB_OUTPUT}"
-
-            - name: Extract changelog
-              env:
-                  VERSION: ${{ steps.version.outputs.version }}
-              run: node scripts/extract-changelog.ts "${VERSION}" > release-notes.md
-
-            - name: Guard existing tag and release
-              id: guard
+            - name: Guard existing GitHub Release
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   VERSION: ${{ steps.version.outputs.version }}
               run: |
                   set -euo pipefail
-
                   if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-                      echo "GitHub Release ${VERSION} already exists."
+                      echo "::error::GitHub Release ${VERSION} already exists."
                       exit 1
                   fi
 
-                  if git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q .; then
-                      echo "Tag ${VERSION} already exists on origin. Finishing the GitHub Release."
-                      echo "resume=true" >> "${GITHUB_OUTPUT}"
-                  else
-                      echo "resume=false" >> "${GITHUB_OUTPUT}"
-                  fi
-
-            - name: Create tag
-              if: steps.version.outputs.did_bump != 'true' && steps.guard.outputs.resume != 'true'
-              env:
-                  VERSION: ${{ steps.version.outputs.version }}
-              run: git tag "${VERSION}"
-
-            - name: Push commit and tag
-              if: steps.guard.outputs.resume != 'true'
-              env:
-                  VERSION: ${{ steps.version.outputs.version }}
-                  DID_BUMP: ${{ steps.version.outputs.did_bump }}
+            - name: Configure git
               run: |
-                  set -euo pipefail
-                  if [ "${DID_BUMP}" = "true" ]; then
-                      git push origin HEAD:master
-                  fi
-                  git push origin "${VERSION}"
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            - name: Build
+            - name: Draft changelog
               env:
                   VERSION: ${{ steps.version.outputs.version }}
               run: |
                   set -euo pipefail
-                  pnpm run build --if-present
-                  mkdir "${{ env.PLUGIN_NAME }}"
-                  cp main.js manifest.json styles.css "${{ env.PLUGIN_NAME }}"
-                  zip -r "${{ env.PLUGIN_NAME }}-${VERSION}.zip" "${{ env.PLUGIN_NAME }}"
+                  pnpm exec standard-version --release-as "${VERSION}" --skip.commit --skip.tag
+                  node scripts/extract-changelog.ts "${VERSION}" > release-notes.md
+
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: release-notes
+                  path: release-notes.md
+                  if-no-files-found: error
+                  retention-days: 30
+
+    build:
+        if: ${{ github.event_name != 'push' || (!contains(github.event.head_commit.message, 'chore(release)') && !contains(github.event.head_commit.message, '[skip release]')) }}
+        needs: prepare
+        uses: ./.github/workflows/plugin-build.yml
+        with:
+            version: ${{ needs.prepare.outputs.version }}
+            sha: ${{ needs.prepare.outputs.source_sha }}
+
+    publish:
+        if: ${{ github.event_name != 'push' || (!contains(github.event.head_commit.message, 'chore(release)') && !contains(github.event.head_commit.message, '[skip release]')) }}
+        needs: [prepare, build]
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
+
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Install
+              run: pnpm install
+
+            - uses: actions/download-artifact@v4
+              with:
+                  name: plugin-dist
+                  path: dist
+
+            - uses: actions/download-artifact@v4
+              with:
+                  name: release-notes
+                  path: notes
 
             - name: Attest build provenance
               uses: actions/attest@v4
               with:
                   subject-path: |
-                      main.js
-                      manifest.json
-                      styles.css
-                      ${{ env.PLUGIN_NAME }}-${{ steps.version.outputs.version }}.zip
+                      dist/main.js
+                      dist/manifest.json
+                      dist/styles.css
+                      dist/${{ env.PLUGIN_NAME }}-${{ needs.prepare.outputs.version }}.zip
 
             - name: Create Release
               uses: softprops/action-gh-release@v3
               with:
-                  tag_name: ${{ steps.version.outputs.version }}
-                  name: ${{ steps.version.outputs.version }}
+                  tag_name: ${{ needs.prepare.outputs.version }}
+                  name: ${{ needs.prepare.outputs.version }}
+                  target_commitish: ${{ needs.prepare.outputs.source_sha }}
                   generate_release_notes: false
-                  body_path: release-notes.md
+                  body_path: notes/release-notes.md
                   draft: false
                   prerelease: false
                   fail_on_unmatched_files: true
                   files: |
-                      main.js
-                      manifest.json
-                      styles.css
-                      ${{ env.PLUGIN_NAME }}-${{ steps.version.outputs.version }}.zip
+                      dist/main.js
+                      dist/manifest.json
+                      dist/styles.css
+                      dist/${{ env.PLUGIN_NAME }}-${{ needs.prepare.outputs.version }}.zip
+
+            - name: Configure git
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            - name: Commit version bump
+              env:
+                  VERSION: ${{ needs.prepare.outputs.version }}
+                  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+              run: |
+                  set -euo pipefail
+                  pnpm exec standard-version --release-as "${VERSION}" --skip.tag
+                  git push origin "HEAD:${DEFAULT_BRANCH}"
