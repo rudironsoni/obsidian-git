@@ -2,7 +2,7 @@ export const RulesyncHooksPlugin = async ({ $ }) => {
   return {
     event: async ({ event }) => {
       if (event.type === "session.created") {
-        await $`echo 'obsidian-git harness active | WasmGit + Vitest | edit .rulesync only'`;
+        await $`echo 'obsidian-git harness active | Vitest + WDIO | edit .rulesync only'`;
       }
     },
     "tool.execute.after": async (input) => {

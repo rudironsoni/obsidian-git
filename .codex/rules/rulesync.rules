@@ -43,6 +43,20 @@ prefix_rule(
     justification = "Generated from Rulesync permission.bash: pnpm run test",
 )
 
+# pnpm run test:e2e
+prefix_rule(
+    pattern = ["pnpm", "run", "test:e2e"],
+    decision = "allow",
+    justification = "Generated from Rulesync permission.bash: pnpm run test:e2e",
+)
+
+# pnpm run wdio:mcp
+prefix_rule(
+    pattern = ["pnpm", "run", "wdio:mcp"],
+    decision = "allow",
+    justification = "Generated from Rulesync permission.bash: pnpm run wdio:mcp",
+)
+
 # pnpm run build
 prefix_rule(
     pattern = ["pnpm", "run", "build"],

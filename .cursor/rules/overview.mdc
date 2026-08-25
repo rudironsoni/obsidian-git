@@ -126,10 +126,13 @@ loads `tests/setup.ts` for every test file. Refer to tests/README.md for details
 ### Harness layers
 
 -   `pnpm run test` runs Vitest against plugin modules with the Obsidian stub
-    and temporary Git repositories.
+    and temporary Git repositories. This is the default gate and the only
+    layer available in Cursor Cloud.
 -   `pnpm run all` is the local quality gate: tsc, Svelte check, Prettier,
-    ESLint, and Vitest.
+    ESLint, and Vitest. It does not launch Obsidian.
 -   `pnpm run build` produces the ignored root `main.js` release artifact.
--   There is no WDIO or real-Obsidian GUI harness in this repository. Do not
-    claim UI or runtime bugs are fixed from unit tests alone when the change
-    is user-visible in Obsidian; say so if a check was skipped.
+-   `pnpm run test:e2e` runs WDIO + `wdio-obsidian-service` against a
+    sandboxed Obsidian with this plugin loaded. GitHub Actions uses xvfb.
+    Do not claim UI or WasmGit-in-Obsidian bugs are fixed from Vitest alone.
+-   Optional local loop: official Obsidian CLI (`obsidian-cli` on macOS) and
+    `@wdio/mcp` for a live WDIO session. Not a CI gate.

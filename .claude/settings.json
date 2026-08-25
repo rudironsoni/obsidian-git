@@ -20,7 +20,9 @@
       "Bash(pnpm run rulesync:generate)",
       "Bash(pnpm run svelte)",
       "Bash(pnpm run test)",
-      "Bash(pnpm run tsc)"
+      "Bash(pnpm run test:e2e)",
+      "Bash(pnpm run tsc)",
+      "Bash(pnpm run wdio:mcp)"
     ]
   },
   "hooks": {
@@ -29,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'obsidian-git harness active | WasmGit + Vitest | edit .rulesync only'"
+            "command": "echo 'obsidian-git harness active | Vitest + WDIO | edit .rulesync only'"
           }
         ]
       }
