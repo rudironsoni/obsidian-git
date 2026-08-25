@@ -150,14 +150,24 @@ export class Lg2 {
             this.stderr = [];
             this.progressHandler = opts?.onProgress;
             this.httpBridge.resetError();
+            // Emscripten's callMain unshifts `./this.program` onto the argv
+            // array it is given. Copy first so callers (and Lg2Error) keep
+            // the real git arguments.
+            const argv = args.slice();
             try {
                 this.module.FS.chdir(cwd);
-                await this.module.callMain(args);
+                await this.module.callMain(argv);
             } catch (error) {
                 this.stderr.push(
                     "THROW: " +
                         (error instanceof Error ? error.message : String(error))
                 );
+                // A WASM trap (OOB, unreachable, abort) kills the instance.
+                // Drop it so the next command re-instantiates instead of
+                // compounding `memory access out of bounds` failures.
+                if (isWasmTrap(error)) {
+                    this.unload();
+                }
             } finally {
                 this.progressHandler = undefined;
             }
@@ -187,6 +197,25 @@ export class Lg2 {
         this.module = undefined;
         this.queue = Promise.resolve();
     }
+}
+
+/** True when `callMain` died of a WebAssembly trap / abort, not a git error. */
+export function isWasmTrap(error: unknown): boolean {
+    if (
+        typeof WebAssembly !== "undefined" &&
+        error instanceof WebAssembly.RuntimeError
+    ) {
+        return true;
+    }
+    if (!(error instanceof Error)) return false;
+    if (error.name === "RuntimeError") return true;
+    return (
+        /memory access out of bounds/i.test(error.message) ||
+        /unreachable/i.test(error.message) ||
+        /table index is out of bounds/i.test(error.message) ||
+        /maximum call stack/i.test(error.message) ||
+        /^Aborted\(/i.test(error.message)
+    );
 }
 
 function getWasmBinaryCopy(): Uint8Array {

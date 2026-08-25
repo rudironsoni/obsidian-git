@@ -15,9 +15,18 @@ import { GeneralModal } from "../../ui/modals/generalModal";
 import { splitRemoteBranch } from "../../utils";
 import { GitManager } from "../gitManager";
 import { HttpStatusError, WasmGitHttpBridge } from "./httpBridge";
-import { Lg2 } from "./lg2";
+import { containsLg2Error, Lg2 } from "./lg2";
 import { GitIgnore } from "./gitIgnore";
-import { parseGitIndex } from "./gitIndex";
+import {
+    GIT_FILEMODE_BLOB,
+    isGitlink,
+    parseGitIndex,
+    removeIndexPath,
+    upsertStagedFile,
+    writeGitIndex,
+    type GitIndexEntry,
+} from "./gitIndex";
+import { runPool, writeGitLooseBlob } from "./gitObject";
 import type { ParsedCommitObject } from "./parsers";
 import {
     applyUnifiedPatch,
@@ -28,6 +37,7 @@ import {
     parseForEachRef,
     parseLog,
     parseLsRemote,
+    parseLsTree,
     parseNameStatus,
     parseRemoteVerbose,
     removeConfigKey,
@@ -50,6 +60,8 @@ const MEM_ROOT = "/repo";
 const MEM_GITDIR = `${MEM_ROOT}/.git`;
 /** Maximum number of paths passed to a single lg2 invocation. */
 const PATH_BATCH_SIZE = 50;
+/** Concurrent vault reads / loose-object writes while staging. */
+const BLOB_WRITE_CONCURRENCY = 8;
 
 /**
  * Sole Git backend for desktop and mobile, powered by wasm-git (libgit2
@@ -75,6 +87,11 @@ export class WasmGit extends GitManager {
     private gitDirMirror: VaultMirror | undefined;
     private gitDirLoaded = false;
     private readonly noticeLength = 999_999;
+    /**
+     * Nested Git operations (commitAll → stageAll + commit) increment this
+     * so only the outermost caller reports the error to the user.
+     */
+    private silenceErrors = 0;
 
     constructor(plugin: ObsidianGit) {
         super(plugin);
@@ -137,8 +154,11 @@ export class WasmGit extends GitManager {
     private async ensureReady(): Promise<void> {
         if (!this.lg2.initialized) {
             await this.lg2.init();
-        }
-        if (!this.worktreeMirror || !this.gitDirMirror) {
+            // A WASM trap unloads the module and invalidates any FS handles
+            // the mirrors still hold, so they must be rebuilt from scratch.
+            this.discardMirrors();
+            this.buildMirrors();
+        } else if (!this.worktreeMirror || !this.gitDirMirror) {
             this.buildMirrors();
         }
         if (!this.gitDirLoaded) {
@@ -178,8 +198,18 @@ export class WasmGit extends GitManager {
     }
 
     private async syncOut(): Promise<void> {
+        if (!this.lg2.initialized) {
+            this.discardMirrors();
+            return;
+        }
         await this.worktreeMirror!.syncOut();
         await this.gitDirMirror!.syncOut();
+    }
+
+    private discardMirrors(): void {
+        this.worktreeMirror = undefined;
+        this.gitDirMirror = undefined;
+        this.gitDirLoaded = false;
     }
 
     /**
@@ -228,7 +258,9 @@ export class WasmGit extends GitManager {
         try {
             return await this.lg2.run(MEM_ROOT, args, opts);
         } finally {
-            if (opts?.worktree === "none") {
+            if (!this.lg2.initialized) {
+                this.discardMirrors();
+            } else if (opts?.worktree === "none") {
                 await this.gitDirMirror!.syncOut();
             } else {
                 await this.syncOut();
@@ -288,7 +320,7 @@ export class WasmGit extends GitManager {
         } catch (error) {
             window.clearTimeout(timeout);
             notice?.hide();
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -305,7 +337,7 @@ export class WasmGit extends GitManager {
         const indexEntries = this.readIndexEntries();
         const index = new Map(
             indexEntries
-                .filter((entry) => entry.stage === 0)
+                .filter((entry) => entry.stage === 0 && !isGitlink(entry.mode))
                 .map((entry) => [entry.path, entry])
         );
         const conflicted = [
@@ -442,11 +474,9 @@ export class WasmGit extends GitManager {
     async stage(filepath: string, relativeToVault: boolean): Promise<void> {
         try {
             const gitPath = this.getRelativeRepoPath(filepath, relativeToVault);
-            // lg2's `add` uses git_index_add_all and therefore also stages
-            // deletions, like `git add -A`.
             await this.addPaths([gitPath]);
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -459,9 +489,6 @@ export class WasmGit extends GitManager {
         status?: Status;
     }): Promise<void> {
         try {
-            // Always add explicit paths so we never run `add .` against a
-            // partial in-memory worktree (that would stage every tracked
-            // file as deleted).
             const current =
                 status ??
                 (await this.status(
@@ -469,21 +496,143 @@ export class WasmGit extends GitManager {
                 ));
             await this.addPaths(current.changed.map((file) => file.path));
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
 
+    /**
+     * Stages paths by writing blobs and a v2/v3 index in TypeScript.
+     *
+     * lg2's `add` calls `git_index_add_all`, which diffs the entire index
+     * against the MEMFS worktree before applying pathspecs. That is unsafe
+     * on the partial worktree this engine keeps (only changed files are
+     * imported; everything else looks deleted) and is what produced
+     * `THROW: memory access out of bounds` on large vaults.
+     */
     private async addPaths(paths: string[]): Promise<void> {
-        if (paths.length === 0) return;
+        const unique: string[] = [];
+        const seen = new Set<string>();
+        for (const path of paths) {
+            const repoPath = this.normalizeRepoPath(path);
+            if (repoPath == undefined) continue;
+            if (this.isExcludedWorktreePath(repoPath)) continue;
+            if (seen.has(repoPath)) continue;
+            seen.add(repoPath);
+            unique.push(repoPath);
+        }
+        if (unique.length === 0) return;
         await this.ensureReady();
-        for (let i = 0; i < paths.length; i += PATH_BATCH_SIZE) {
-            const batch = paths.slice(i, i + PATH_BATCH_SIZE);
-            if (batch.length === 0) continue;
-            await this.worktreeMirror!.importFiles(batch);
-            await this.lg2.run(MEM_ROOT, ["add", ...batch]);
+        let entries = this.readIndexEntries();
+        const ops = await runPool(unique, BLOB_WRITE_CONCURRENCY, (repoPath) =>
+            this.stagePathOp(repoPath)
+        );
+        for (const op of ops) {
+            switch (op.kind) {
+                case "remove":
+                    entries = removeIndexPath(entries, op.path);
+                    break;
+                case "upsert":
+                    entries = upsertStagedFile(entries, op.entry);
+                    break;
+                case "skip":
+                    break;
+                default: {
+                    const _exhaustive: never = op;
+                    throw new Error(
+                        `unhandled stage operation ${JSON.stringify(_exhaustive)}`
+                    );
+                }
+            }
+        }
+        await this.persistIndex(entries);
+    }
+
+    private async stagePathOp(repoPath: string): Promise<StageOp> {
+        const vaultPath = this.getRelativeVaultPath(repoPath);
+        if (!(await this.adapter.exists(vaultPath))) {
+            return { kind: "remove", path: repoPath };
+        }
+        const stat = await this.adapter.stat(vaultPath);
+        if (stat?.type !== "file") return { kind: "skip" };
+        const data = new Uint8Array(await this.adapter.readBinary(vaultPath));
+        const hash = await writeGitLooseBlob(this.lg2.fs, MEM_GITDIR, data);
+        return {
+            kind: "upsert",
+            entry: {
+                path: repoPath,
+                hash,
+                size: data.byteLength,
+                mtimeSeconds: Math.floor(stat.mtime / 1000),
+                stage: 0,
+                mode: GIT_FILEMODE_BLOB,
+            },
+        };
+    }
+
+    private async stageBlob(
+        entries: GitIndexEntry[],
+        repoPath: string,
+        data: Uint8Array,
+        mtimeMs: number
+    ): Promise<GitIndexEntry[]> {
+        const hash = await writeGitLooseBlob(this.lg2.fs, MEM_GITDIR, data);
+        return upsertStagedFile(entries, {
+            path: repoPath,
+            hash,
+            size: data.byteLength,
+            mtimeSeconds: Math.floor(mtimeMs / 1000),
+            stage: 0,
+            mode: GIT_FILEMODE_BLOB,
+        });
+    }
+
+    /**
+     * Two-phase persist: sync newly written loose objects first, then
+     * replace `index` via `index.lock` so a crash cannot leave the vault
+     * pointing at blobs that were never flushed.
+     */
+    private async persistIndex(entries: GitIndexEntry[]): Promise<void> {
+        await this.gitDirMirror!.syncOut();
+        const indexPath = `${MEM_GITDIR}/index`;
+        const lockPath = `${MEM_GITDIR}/index.lock`;
+        const data = await writeGitIndex(entries);
+        try {
+            this.lg2.fs.writeFile(lockPath, data);
+            if (this.lg2.fs.analyzePath(indexPath).exists) {
+                this.lg2.fs.unlink(indexPath);
+            }
+            this.lg2.fs.rename(lockPath, indexPath);
+        } catch (error) {
+            if (this.lg2.fs.analyzePath(lockPath).exists) {
+                this.lg2.fs.unlink(lockPath);
+            }
+            throw error;
         }
         await this.gitDirMirror!.syncOut();
+    }
+
+    /**
+     * Repository-relative path with `..` rejected. Returns undefined for
+     * empty / `.` inputs that are not real files.
+     */
+    private normalizeRepoPath(path: string): string | undefined {
+        const trimmed = path
+            .replace(/\\/g, "/")
+            .replace(/\/{2,}/g, "/")
+            .replace(/^\.\//, "")
+            .replace(/\/$/, "");
+        if (trimmed === "" || trimmed === ".") return undefined;
+        if (trimmed.startsWith("/") || trimmed.includes("\0")) {
+            throw new Error(`refusing to stage unsafe path '${path}'`);
+        }
+        const parts = trimmed.split("/");
+        if (
+            parts.some((part) => part === "" || part === "." || part === "..")
+        ) {
+            throw new Error(`refusing to stage unsafe path '${path}'`);
+        }
+        return trimmed;
     }
 
     async unstage(filepath: string, relativeToVault: boolean): Promise<void> {
@@ -491,7 +640,7 @@ export class WasmGit extends GitManager {
             const gitPath = this.getRelativeRepoPath(filepath, relativeToVault);
             await this.unstagePaths((path) => path === gitPath);
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -511,26 +660,101 @@ export class WasmGit extends GitManager {
                 );
             }
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
 
     /**
-     * lg2's `reset` cannot operate on individual paths, so per-path
-     * unstaging resets the whole index to HEAD and re-stages everything that
-     * should stay staged. Because Obsidian's UI only ever stages whole files
-     * from the working tree, re-adding from the working tree is equivalent.
+     * Restores each path in the index from HEAD. Unlike `reset HEAD` +
+     * re-add, this leaves other staged files (including staged content that
+     * no longer matches the worktree) untouched.
      */
     private async unstagePaths(
         shouldUnstage: (path: string) => boolean
     ): Promise<void> {
-        const status = await this.status();
-        const keepStaged = status.staged
-            .map((file) => file.path)
-            .filter((path) => !shouldUnstage(path));
-        await this.resetIndexToHead();
-        await this.addPaths(keepStaged);
+        await this.ensureReady();
+        let entries = this.readIndexEntries();
+        const targets = [
+            ...new Set(
+                entries.map((entry) => entry.path).filter(shouldUnstage)
+            ),
+        ];
+        if (targets.length === 0) return;
+        if (!(await this.headExists())) {
+            for (const path of targets) {
+                entries = removeIndexPath(entries, path);
+            }
+            await this.persistIndex(entries);
+            return;
+        }
+        const headEntries = await this.lookupHeadFiles(targets);
+        for (const path of targets) {
+            const head = headEntries.get(path);
+            if (!head) {
+                entries = removeIndexPath(entries, path);
+            } else {
+                entries = upsertStagedFile(entries, head);
+            }
+        }
+        await this.persistIndex(entries);
+    }
+
+    /**
+     * Looks up HEAD blobs for `paths` via `ls-tree`, falling back to
+     * `rev-parse HEAD:path` when lg2 has no ls-tree command.
+     */
+    private async lookupHeadFiles(
+        paths: string[]
+    ): Promise<Map<string, GitIndexEntry>> {
+        const found = new Map<string, GitIndexEntry>();
+        for (let i = 0; i < paths.length; i += PATH_BATCH_SIZE) {
+            const batch = paths.slice(i, i + PATH_BATCH_SIZE);
+            const listed = await this.readGitDir(
+                ["ls-tree", "HEAD", "--", ...batch],
+                { ignoreErrors: true }
+            );
+            if (!containsLg2Error(listed.stderr)) {
+                for (const row of parseLsTree(listed.stdout)) {
+                    if (row.type === "tree") continue;
+                    found.set(row.path, {
+                        path: row.path,
+                        hash: row.hash,
+                        size: 0,
+                        mtimeSeconds: 0,
+                        stage: 0,
+                        mode: row.mode,
+                    });
+                }
+            }
+        }
+        const missing = paths.filter((path) => !found.has(path));
+        await runPool(missing, BLOB_WRITE_CONCURRENCY, async (path) => {
+            const hash = await this.revParse(`HEAD:${path}`);
+            if (!hash) return;
+            found.set(path, {
+                path,
+                hash,
+                size: 0,
+                mtimeSeconds: 0,
+                stage: 0,
+                mode: GIT_FILEMODE_BLOB,
+            });
+        });
+        const resolved = [...found.values()];
+        await runPool(resolved, BLOB_WRITE_CONCURRENCY, async (entry) => {
+            entry.size = await this.objectSize(entry.hash);
+        });
+        return found;
+    }
+
+    private async objectSize(hash: string): Promise<number> {
+        const sized = await this.readGitDir(["cat-file", "-s", hash], {
+            ignoreErrors: true,
+        });
+        const parsed = Number.parseInt(sized.stdout.trim(), 10);
+        if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+        return 0;
     }
 
     private async resetIndexToHead(): Promise<void> {
@@ -562,7 +786,7 @@ export class WasmGit extends GitManager {
             await this.worktreeMirror!.exportFiles([filepath]);
             await this.gitDirMirror!.syncOut();
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -592,7 +816,7 @@ export class WasmGit extends GitManager {
             }
             await this.gitDirMirror!.syncOut();
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -610,13 +834,13 @@ export class WasmGit extends GitManager {
         unstagedFiles?: UnstagedFile[];
         amend?: boolean;
     }): Promise<number | undefined> {
+        this.silenceErrors += 1;
         try {
             await this.checkAuthorInfo();
             await this.stageAll({});
             return await this.commit({ message, amend });
-        } catch (error) {
-            this.plugin.displayError(error);
-            throw error;
+        } finally {
+            this.silenceErrors -= 1;
         }
     }
 
@@ -662,7 +886,7 @@ export class WasmGit extends GitManager {
                 }
                 return status.staged.length;
             } catch (error) {
-                this.plugin.displayError(error);
+                this.reportError(error);
                 throw error;
             }
         });
@@ -728,7 +952,7 @@ export class WasmGit extends GitManager {
                 }));
             } catch (error) {
                 progressNotice?.hide();
-                this.plugin.displayError(error);
+                this.reportError(error);
                 throw error;
             }
         });
@@ -847,7 +1071,7 @@ export class WasmGit extends GitManager {
             } catch (error) {
                 progressNotice?.hide();
                 if (!(error instanceof NoNetworkError)) {
-                    this.plugin.displayError(error);
+                    this.reportError(error);
                 }
                 throw error;
             }
@@ -861,7 +1085,7 @@ export class WasmGit extends GitManager {
             progressNotice?.hide();
         } catch (error) {
             progressNotice?.hide();
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -959,7 +1183,7 @@ export class WasmGit extends GitManager {
             }
             return { current, tracking, branches, remote };
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -981,7 +1205,7 @@ export class WasmGit extends GitManager {
                 await this.mutate(["checkout", branch]);
             }
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -990,7 +1214,7 @@ export class WasmGit extends GitManager {
         try {
             await this.mutate(["checkout", "-b", branch], { worktree: "none" });
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -1031,7 +1255,7 @@ export class WasmGit extends GitManager {
             }
             await this.syncOut();
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -1050,7 +1274,7 @@ export class WasmGit extends GitManager {
             await this.mutate(["init", "."], { worktree: "none" });
             this.gitDirLoaded = true;
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -1110,7 +1334,7 @@ export class WasmGit extends GitManager {
             progressNotice?.hide();
         } catch (error) {
             progressNotice?.hide();
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -1145,7 +1369,7 @@ export class WasmGit extends GitManager {
                 });
             }
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -1175,7 +1399,7 @@ export class WasmGit extends GitManager {
                 });
             }
         } catch (error) {
-            this.plugin.displayError(error);
+            this.reportError(error);
             throw error;
         }
     }
@@ -1563,33 +1787,25 @@ export class WasmGit extends GitManager {
     /**
      * Applies a unified diff to the index (`git apply --cached`).
      * lg2 has no `apply` command, so the patch is applied in TypeScript to
-     * the current index blob, then staged via a worktree swap that restores
-     * the user's working-tree content afterwards.
+     * the current index blob and written with the same blob/index engine as
+     * `add` — never `lg2 add`, which OOB-traps on a sparse MEMFS worktree.
      */
     async applyPatch(patch: string): Promise<void> {
         const repoPath = extractPatchPath(patch);
         if (repoPath == undefined) {
             throw new Error("Patch is missing a +++ b/<path> header");
         }
-        await this.syncIn();
-        try {
-            const memPath = `${MEM_ROOT}/${repoPath}`;
-            const originalExists = this.lg2.fs.analyzePath(memPath).exists;
-            const original = originalExists
-                ? this.lg2.fs.readFile(memPath, { encoding: "utf8" })
-                : "";
-            const source = (await this.readIndexFile(repoPath)) ?? "";
-            const patched = applyUnifiedPatch(source, patch);
-            this.lg2.fs.writeFile(memPath, patched);
-            await this.lg2.run(MEM_ROOT, ["add", repoPath]);
-            if (originalExists) {
-                this.lg2.fs.writeFile(memPath, original);
-            } else if (this.lg2.fs.analyzePath(memPath).exists) {
-                this.lg2.fs.unlink(memPath);
-            }
-        } finally {
-            await this.syncOut();
+        const safe = this.normalizeRepoPath(repoPath);
+        if (safe == undefined) {
+            throw new Error(`Patch path '${repoPath}' is not a file path`);
         }
+        await this.ensureReady();
+        const source = (await this.readIndexFile(safe)) ?? "";
+        const patched = applyUnifiedPatch(source, patch);
+        const data = new TextEncoder().encode(patched);
+        let entries = this.readIndexEntries();
+        entries = await this.stageBlob(entries, safe, data, Date.now());
+        await this.persistIndex(entries);
     }
 
     /**
@@ -1716,6 +1932,11 @@ export class WasmGit extends GitManager {
         this.gitDirLoaded = false;
     }
 
+    private reportError(error: unknown): void {
+        if (this.silenceErrors > 0) return;
+        this.plugin.displayError(error);
+    }
+
     private showNotice(message: string, infinity = true): Notice | undefined {
         if (!this.plugin.settings.disablePopups) {
             return new Notice(
@@ -1726,6 +1947,11 @@ export class WasmGit extends GitManager {
         return undefined;
     }
 }
+
+type StageOp =
+    | { kind: "skip" }
+    | { kind: "remove"; path: string }
+    | { kind: "upsert"; entry: GitIndexEntry };
 
 function resetMemRepo(lg2: Lg2): void {
     if (lg2.fs.analyzePath(MEM_ROOT).exists) {

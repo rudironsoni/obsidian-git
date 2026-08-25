@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { GitIndexEntry } from "../../../src/gitManager/wasmGit/gitIndex";
+import {
+    GIT_FILEMODE_BLOB,
+    type GitIndexEntry,
+} from "../../../src/gitManager/wasmGit/gitIndex";
 import {
     collapseUntrackedDirectories,
     collectUntracked,
@@ -16,6 +19,7 @@ function entry(
         path,
         mtimeSeconds: 1_700_000_000,
         stage: 0,
+        mode: GIT_FILEMODE_BLOB,
         ...args,
     };
 }

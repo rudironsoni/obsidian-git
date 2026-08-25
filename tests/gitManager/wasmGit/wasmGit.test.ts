@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { describe, expect, it, vi } from "vitest";
 import { WasmGit } from "../../../src/gitManager/wasmGit/wasmGit";
+import { Lg2Error } from "../../../src/gitManager/wasmGit/lg2";
 import {
     NoNetworkError,
     UserCanceledError,
@@ -316,6 +317,111 @@ describe("WasmGit staging", () => {
         const untracked = await vault.manager.getUntrackedPaths({});
 
         expect(untracked.sort()).toEqual(["loose.md", "newdir/"]);
+    });
+
+    it("stages 50 long paths including a comma-and-space filename", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        const files: string[] = [];
+        for (let i = 0; i < 49; i++) {
+            const relative = `b2b-platform-brain/.cursor/skills/skill-${String(i).padStart(3, "0")}-with-a-fairly-long-directory-name/SKILL.md`;
+            mkdirSync(path.join(vault.dir, path.dirname(relative)), {
+                recursive: true,
+            });
+            writeFileSync(path.join(vault.dir, relative), `skill ${i}\n`);
+            files.push(relative);
+        }
+        mkdirSync(path.join(vault.dir, "Journal"), { recursive: true });
+        const journal = "Journal/2026-08-21, Friday.md";
+        writeFileSync(path.join(vault.dir, journal), "friday\n");
+        files.push(journal);
+
+        await vault.manager.stageAll({});
+
+        const staged = await gitStaged(vault.dir);
+        expect(staged).toHaveLength(50);
+        expect(staged).toContain(journal);
+        expect(
+            (await git(vault.dir, ["hash-object", journal])).trim()
+        ).toBeTruthy();
+        expect(
+            (await git(vault.dir, ["cat-file", "-p", `:${journal}`])).trim()
+        ).toBe("friday");
+    });
+
+    it("stages empty, binary, and unicode paths", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, "empty.md"), "");
+        writeFileSync(
+            path.join(vault.dir, "data.bin"),
+            Buffer.from([0, 1, 255])
+        );
+        writeFileSync(path.join(vault.dir, "café.md"), "unicode\n");
+
+        await vault.manager.stage("empty.md", true);
+        await vault.manager.stage("data.bin", true);
+        await vault.manager.stage("café.md", true);
+
+        expect((await gitStaged(vault.dir)).sort()).toEqual([
+            "café.md",
+            "data.bin",
+            "empty.md",
+        ]);
+        expect(
+            (await git(vault.dir, ["cat-file", "-p", ":empty.md"])).length
+        ).toBe(0);
+        expect((await git(vault.dir, ["rev-parse", ":data.bin"])).trim()).toBe(
+            (await git(vault.dir, ["hash-object", "data.bin"])).trim()
+        );
+    });
+
+    it("unstaging one file does not restage a dirty worktree of another staged file", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, "note.md"), "staged version\n");
+        await vault.manager.stage("note.md", true);
+        writeFileSync(path.join(vault.dir, "note.md"), "worktree dirty\n");
+        writeFileSync(path.join(vault.dir, "other.md"), "other\n");
+        await vault.manager.stage("other.md", true);
+
+        await vault.manager.unstage("other.md", true);
+
+        expect(await gitStaged(vault.dir)).toEqual(["note.md"]);
+        expect(
+            (await git(vault.dir, ["cat-file", "-p", ":note.md"])).trim()
+        ).toBe("staged version");
+        expect(readFileSync(path.join(vault.dir, "note.md"), "utf8")).toBe(
+            "worktree dirty\n"
+        );
+        expect(await gitUntracked(vault.dir)).toContain("other.md");
+    });
+
+    it("unstaging a new file after HEAD exists drops it from the index", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, "brand-new.md"), "new\n");
+        await vault.manager.stage("brand-new.md", true);
+        await vault.manager.unstage("brand-new.md", true);
+        expect(await gitStaged(vault.dir)).toEqual([]);
+        expect(await gitUntracked(vault.dir)).toContain("brand-new.md");
+    });
+
+    it("keeps the original git argv in Lg2Error (not ./this.program)", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        const error = await vault.manager.show("HEAD", "missing.md").then(
+            () => {
+                throw new Error("expected show() to reject");
+            },
+            (caught: unknown) => caught
+        );
+        expect(error).toBeInstanceOf(Lg2Error);
+        const failed = error as Lg2Error;
+        expect(failed.args[0]).toBe("cat-file");
+        expect(failed.args).not.toContain("./this.program");
+        expect(failed.message).toMatch(/^git cat-file /);
+        expect(failed.message).not.toMatch(/\.\/this\.program/);
     });
 });
 

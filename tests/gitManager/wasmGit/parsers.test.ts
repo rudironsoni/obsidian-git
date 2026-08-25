@@ -9,6 +9,7 @@ import {
     parseGitDate,
     parseLog,
     parseLsRemote,
+    parseLsTree,
     parseNameStatus,
     parseRemoteVerbose,
     parseStatus,
@@ -263,6 +264,27 @@ describe("parseCommitObject", () => {
 
     it("returns undefined for non-commit content", () => {
         expect(parseCommitObject("not a commit")).toBeUndefined();
+    });
+});
+
+describe("parseLsTree", () => {
+    it("parses blob, tree, and gitlink lines", () => {
+        const blob = "a".repeat(40);
+        const tree = "b".repeat(40);
+        const commit = "c".repeat(40);
+        const entries = parseLsTree(
+            [
+                `100644 blob ${blob}\tnote.md`,
+                `040000 tree ${tree}\tsub`,
+                `160000 commit ${commit}\tvendor`,
+                "not a line",
+            ].join("\n")
+        );
+        expect(entries).toEqual([
+            { mode: 0o100644, type: "blob", hash: blob, path: "note.md" },
+            { mode: 0o40000, type: "tree", hash: tree, path: "sub" },
+            { mode: 0o160000, type: "commit", hash: commit, path: "vendor" },
+        ]);
     });
 });
 
