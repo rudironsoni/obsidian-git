@@ -7,7 +7,14 @@ import { defineConfig } from "eslint/config";
 
 export default defineConfig(
     {
-        ignores: ["**/node_modules/", "**/main.js", "eslint.config.mjs", "esbuild.config.mjs"],
+        ignores: [
+            "**/node_modules/",
+            "**/main.js",
+            "eslint.config.mjs",
+            "esbuild.config.mjs",
+            "scripts/**/*.py",
+            "scripts/**/*.sh",
+        ],
     },
     eslint.configs.recommended,
     ...tseslint.configs.recommendedTypeChecked,

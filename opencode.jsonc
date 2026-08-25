@@ -1,0 +1,24 @@
+{
+  "permission": {
+    "bash": {
+      "pnpm install": "allow",
+      "pnpm run tsc": "allow",
+      "pnpm run svelte": "allow",
+      "pnpm run lint": "allow",
+      "pnpm run format": "allow",
+      "pnpm run test": "allow",
+      "pnpm run build": "allow",
+      "pnpm run all": "allow",
+      "pnpm run rulesync:check": "allow",
+      "pnpm run rulesync:generate": "allow",
+      "echo EXIT:*": "allow",
+      "*; echo EXIT:*": "allow",
+      "*;echo EXIT:*": "allow",
+      "* && echo EXIT:*": "allow",
+      "* &&echo EXIT:*": "allow",
+      "*; echo \"EXIT:$?\"": "allow",
+      "* && echo \"EXIT:$?\"": "allow"
+    }
+  },
+  "mcp": {}
+}

@@ -14,7 +14,10 @@
         "test": "vitest run",
         "test:watch": "vitest",
         "test:coverage": "vitest run --coverage",
-        "all": "pnpm run tsc && pnpm run svelte && pnpm run format && pnpm run lint && pnpm run test"
+        "all": "pnpm run tsc && pnpm run svelte && pnpm run format && pnpm run lint && pnpm run test",
+        "rulesync:install": "rulesync install",
+        "rulesync:generate": "bash scripts/rulesync-generate.sh",
+        "rulesync:check": "bash scripts/rulesync-generate.sh --check"
     },
     "keywords": [],
     "author": "Rudimar Ronsoni",
@@ -50,6 +53,7 @@
         "obsidian": "^1.13.1",
         "prettier": "3.3.2",
         "prettier-plugin-svelte": "^4.1.1",
+        "rulesync": "^16.17.0",
         "sass": "^1.103.1",
         "scss": "^0.2.4",
         "standard-version": "^9.5.0",

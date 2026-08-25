@@ -13,6 +13,10 @@ yarn.lock
 .prettierignore
 /data.json
 
-.vscode
+.vscode/*
+!.vscode/mcp.json
+!.vscode/settings.json
 
 .DS_Store
+scripts/__pycache__/
+*.pyc

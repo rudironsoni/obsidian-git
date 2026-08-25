@@ -1,0 +1,34 @@
+{
+  "lockfileVersion": 1,
+  "sources": {
+    "yungho/obsidian-plugin-dev": {
+      "requestedRef": "main",
+      "resolvedRef": "2a32c661bbba8ef2ddcc99f6cec70c8b4955cb73",
+      "resolvedAt": "2026-08-25T21:07:39.634Z",
+      "skills": {
+        "reference": {
+          "integrity": "sha256-13bf05567eba103e4a109f0c23658370206e7071384fd4c82aa77705376fa34f"
+        }
+      }
+    },
+    "davidvkimball/obsidian-dev-skills:.": {
+      "requestedRef": "master",
+      "resolvedRef": "fc1ea8abeaf37759686393f3e7755f4ba11f6243",
+      "resolvedAt": "2026-08-25T21:09:09.891Z",
+      "skills": {
+        "obsidian-dev": {
+          "integrity": "sha256-081de4090a5fdef06691cc419abf86a3521131474fd23af77e5f4537b3c92018"
+        },
+        "obsidian-ops": {
+          "integrity": "sha256-8306697915fd6f9cd0a1598fe9d961eccaa8c9661ac9ed38045ca4da39b51168"
+        },
+        "obsidian-ref": {
+          "integrity": "sha256-f7f4c279ce19efa2d4cf3bb1f6e4bfeda669093b2fed5e67ab84f2e02c5729bd"
+        },
+        "obsidian-theme-dev": {
+          "integrity": "sha256-b521008afcb554dc4303901bae94e2dc4e96b2a7dc330d2207083765d4346a5d"
+        }
+      }
+    }
+  }
+}

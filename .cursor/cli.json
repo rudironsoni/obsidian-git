@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(* && echo \"EXIT:$?\")",
+      "Shell(* && echo EXIT:*)",
+      "Shell(* &&echo EXIT:*)",
+      "Shell(*; echo \"EXIT:$?\")",
+      "Shell(*; echo EXIT:*)",
+      "Shell(*;echo EXIT:*)",
+      "Shell(echo EXIT:*)",
+      "Shell(pnpm install)",
+      "Shell(pnpm run all)",
+      "Shell(pnpm run build)",
+      "Shell(pnpm run format)",
+      "Shell(pnpm run lint)",
+      "Shell(pnpm run rulesync:check)",
+      "Shell(pnpm run rulesync:generate)",
+      "Shell(pnpm run svelte)",
+      "Shell(pnpm run test)",
+      "Shell(pnpm run tsc)"
+    ]
+  }
+}

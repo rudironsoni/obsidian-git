@@ -2,3 +2,6 @@ allowBuilds:
   '@parcel/watcher': false
   esbuild: true
   svelte-preprocess: true
+  tldjs: false
+minimumReleaseAgeExclude:
+  - rulesync@16.17.0

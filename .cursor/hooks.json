@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "command": "echo 'obsidian-git harness active | WasmGit + Vitest | edit .rulesync only'"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "git diff --name-only | grep '\\.ts$' >/dev/null && pnpm run tsc || true",
+        "matcher": "Write|Edit"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "echo 'Executing bash command. Do not edit generated agent files; change .rulesync/ instead.'",
+        "matcher": "Bash"
+      }
+    ]
+  }
+}
