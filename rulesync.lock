@@ -29,6 +29,16 @@
           "integrity": "sha256-b521008afcb554dc4303901bae94e2dc4e96b2a7dc330d2207083765d4346a5d"
         }
       }
+    },
+    "gapmiss/obsidian-plugin-skill:.agents/skills": {
+      "requestedRef": "main",
+      "resolvedRef": "aebdf69f769ca95a62ce6b87822261bc05c74924",
+      "resolvedAt": "2026-08-25T21:59:12.788Z",
+      "skills": {
+        "obsidian": {
+          "integrity": "sha256-605e1e63354b534dd5571cb97b3165935a5ddcbbd2130fec07a8670c1b396160"
+        }
+      }
     }
   }
 }
