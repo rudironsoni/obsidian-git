@@ -7,6 +7,8 @@
             "pnpm run lint": "allow",
             "pnpm run format": "allow",
             "pnpm run test": "allow",
+            "pnpm run test:e2e": "allow",
+            "pnpm run wdio:mcp": "allow",
             "pnpm run build": "allow",
             "pnpm run all": "allow",
             "pnpm run rulesync:check": "allow",

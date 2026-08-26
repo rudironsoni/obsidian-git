@@ -58,3 +58,51 @@ jobs:
               run: pnpm install
             - name: Run build
               run: pnpm run build
+    e2e:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v7
+            - uses: pnpm/action-setup@v6
+              with:
+                  version: latest
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+            - name: Install modules
+              run: pnpm install --frozen-lockfile
+            - name: Build plugin
+              run: pnpm run build
+            - name: Get Obsidian cache key
+              run: |
+                  pnpm exec tsx wdio.conf.mts | grep "obsidian-cache-key:" > obsidian-versions-lock.txt
+                  rm -rf .obsidian-cache
+              env:
+                  OBSIDIAN_EMAIL: ${{ secrets.OBSIDIAN_EMAIL }}
+                  OBSIDIAN_PASSWORD: ${{ secrets.OBSIDIAN_PASSWORD }}
+            - name: Cache Obsidian
+              uses: actions/cache@v4
+              with:
+                  path: .obsidian-cache
+                  key: obsidian-cache-${{ runner.os }}-${{ hashFiles('obsidian-versions-lock.txt') }}
+            - name: Setup virtual graphics
+              run: |
+                  sudo rm -rf /etc/apt/sources.list.d/*.list
+                  echo "set man-db/auto-update false" | sudo debconf-communicate
+                  sudo dpkg-reconfigure man-db
+                  sudo apt-get update -q
+                  sudo apt-get install -q -y herbstluftwm dzen2 x11-xserver-utils libgtk-3-0 libnss3 libxss1 libgbm1 libdrm2 libatk-bridge2.0-0 libatspi2.0-0 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2
+                  sudo apt-get install -q -y libasound2t64 || sudo apt-get install -q -y libasound2
+                  export DISPLAY=:99
+                  echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
+                  Xvfb $DISPLAY -screen 0 1280x1024x24 +extension GLX -noreset &
+                  sleep 1
+                  herbstluftwm &
+                  sleep 1
+            - name: Run WDIO e2e
+              run: pnpm exec wdio run ./wdio.conf.mts
+              env:
+                  WDIO_MAX_INSTANCES: 1
+                  OBSIDIAN_EMAIL: ${{ secrets.OBSIDIAN_EMAIL }}
+                  OBSIDIAN_PASSWORD: ${{ secrets.OBSIDIAN_PASSWORD }}
