@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [3.1.2](https://github.com/rudironsoni/obsidian-git/compare/3.1.1...3.1.2) (2026-08-26)
+
+
+### Features
+
+* Rulesync-owned agent harness ([#13](https://github.com/rudironsoni/obsidian-git/issues/13)) ([e4508fd](https://github.com/rudironsoni/obsidian-git/commit/e4508fd0800de2f75bbd23dfc5b6468a6dcf23b0))
+
+
+### Bug Fixes
+
+* **ci:** quote plugin-build workflow_dispatch description ([#15](https://github.com/rudironsoni/obsidian-git/issues/15)) ([6692f43](https://github.com/rudironsoni/obsidian-git/commit/6692f436a5c5fb477bb49ca77afbfbea54de5955))
+
 ### [3.1.1](https://github.com/rudironsoni/obsidian-git/compare/3.1.0...3.1.1) (2026-08-21)
 
 ## [3.1.0](https://github.com/rudironsoni/obsidian-git/compare/3.0.3...3.1.0) (2026-08-20)
