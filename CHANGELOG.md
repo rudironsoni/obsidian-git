@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [3.1.4](https://github.com/rudironsoni/obsidian-git/compare/3.1.3...3.1.4) (2026-08-26)
+
+
+### Features
+
+* **wasm-git:** port Git LFS and rebase/reset pull strategies ([#17](https://github.com/rudironsoni/obsidian-git/issues/17)) ([65b5185](https://github.com/rudironsoni/obsidian-git/commit/65b51850c453d9e6d197d52d6d5a7fcb9a00d97f))
+
 ### [3.1.3](https://github.com/rudironsoni/obsidian-git/compare/3.1.2...3.1.3) (2026-08-26)
 
 ### [3.1.2](https://github.com/rudironsoni/obsidian-git/compare/3.1.1...3.1.2) (2026-08-26)
