@@ -25,7 +25,7 @@ on:
                 type: string
                 required: true
             sha:
-                description: Commit SHA to build (default: current SHA)
+                description: "Commit SHA to build (default: current SHA)"
                 type: string
                 required: false
 
