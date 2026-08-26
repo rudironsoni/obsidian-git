@@ -7,6 +7,7 @@ import type {
     FileStatusResult,
     LogEntry,
     Status,
+    SyncMethod,
     UnstagedFile,
     WalkDifference,
 } from "../../types";
@@ -16,6 +17,20 @@ import { splitRemoteBranch } from "../../utils";
 import { GitManager } from "../gitManager";
 import { HttpStatusError, WasmGitHttpBridge } from "./httpBridge";
 import { containsLg2Error, Lg2 } from "./lg2";
+import type { LfsAttributeRule, LfsPointer } from "./lfs";
+import {
+    hashLfsContent,
+    isLfsTracked,
+    lfsBatch,
+    lfsBatchEndpoint,
+    lfsTransfer,
+    parseGitAttributes,
+    parseLfsConfigUrl,
+    parseLfsPointer,
+    serializeLfsPointer,
+} from "./lfs";
+import type { RebaseHost } from "./rebase";
+import { RebaseConflictError, rebaseOnto } from "./rebase";
 import { GitIgnore } from "./gitIgnore";
 import {
     GIT_FILEMODE_BLOB,
@@ -202,6 +217,7 @@ export class WasmGit extends GitManager {
             this.discardMirrors();
             return;
         }
+        await this.smudgeLfsWorktree();
         await this.worktreeMirror!.syncOut();
         await this.gitDirMirror!.syncOut();
     }
@@ -523,9 +539,10 @@ export class WasmGit extends GitManager {
         }
         if (unique.length === 0) return;
         await this.ensureReady();
+        const lfsRules = await this.readLfsAttributeRules();
         let entries = this.readIndexEntries();
         const ops = await runPool(unique, BLOB_WRITE_CONCURRENCY, (repoPath) =>
-            this.stagePathOp(repoPath)
+            this.stagePathOp(repoPath, lfsRules)
         );
         for (const op of ops) {
             switch (op.kind) {
@@ -548,7 +565,34 @@ export class WasmGit extends GitManager {
         await this.persistIndex(entries);
     }
 
-    private async stagePathOp(repoPath: string): Promise<StageOp> {
+    /** Stages paths from the in-memory worktree (used during rebase replay). */
+    private async stageMemfsPaths(paths: string[]): Promise<void> {
+        if (paths.length === 0) return;
+        await this.ensureReady();
+        let entries = this.readIndexEntries();
+        for (const repoPath of paths) {
+            const normalized = this.normalizeRepoPath(repoPath);
+            if (normalized == undefined) continue;
+            const memPath = `${MEM_ROOT}/${normalized}`;
+            if (!this.lg2.fs.analyzePath(memPath).exists) {
+                entries = removeIndexPath(entries, normalized);
+                continue;
+            }
+            const data = this.lg2.fs.readFile(memPath);
+            entries = await this.stageBlob(
+                entries,
+                normalized,
+                data,
+                Date.now()
+            );
+        }
+        await this.persistIndex(entries);
+    }
+
+    private async stagePathOp(
+        repoPath: string,
+        lfsRules: LfsAttributeRule[]
+    ): Promise<StageOp> {
         const vaultPath = this.getRelativeVaultPath(repoPath);
         if (!(await this.adapter.exists(vaultPath))) {
             return { kind: "remove", path: repoPath };
@@ -556,13 +600,21 @@ export class WasmGit extends GitManager {
         const stat = await this.adapter.stat(vaultPath);
         if (stat?.type !== "file") return { kind: "skip" };
         const data = new Uint8Array(await this.adapter.readBinary(vaultPath));
-        const hash = await writeGitLooseBlob(this.lg2.fs, MEM_GITDIR, data);
+        let blobData = data;
+        if (isLfsTracked(repoPath, lfsRules)) {
+            const pointerText = serializeLfsPointer(
+                hashLfsContent(data),
+                data.byteLength
+            );
+            blobData = new TextEncoder().encode(pointerText);
+        }
+        const hash = await writeGitLooseBlob(this.lg2.fs, MEM_GITDIR, blobData);
         return {
             kind: "upsert",
             entry: {
                 path: repoPath,
                 hash,
-                size: data.byteLength,
+                size: blobData.byteLength,
                 mtimeSeconds: Math.floor(stat.mtime / 1000),
                 stage: 0,
                 mode: GIT_FILEMODE_BLOB,
@@ -920,17 +972,11 @@ export class WasmGit extends GitManager {
                     );
                 }
 
-                const mergeResult = await this.withAuthRetry(() =>
-                    this.mutate(["merge", branchInfo.tracking!], {
-                        ignoreErrors: true,
-                    })
-                );
-                const conflicted = this.parseMergeConflicts(mergeResult.stderr);
-                if (conflicted.length > 0) {
-                    await this.handleMergeConflicts(conflicted, branchInfo);
-                } else if (/Bad news:|\s\[-?\d+\]/m.test(mergeResult.stderr)) {
-                    throw new Error(
-                        `Merge failed: ${mergeResult.stderr.trim()}`
+                const trackingCommit = await this.revParse(branchInfo.tracking);
+                if (localCommit !== trackingCommit) {
+                    await this.integrateFetched(
+                        this.plugin.settings.syncMethod ?? "merge",
+                        branchInfo
                     );
                 }
 
@@ -956,6 +1002,162 @@ export class WasmGit extends GitManager {
                 throw error;
             }
         });
+    }
+
+    private async integrateFetched(
+        method: SyncMethod,
+        branchInfo: BranchInfo
+    ): Promise<void> {
+        switch (method) {
+            case "merge":
+                await this.mergeTracking(branchInfo);
+                return;
+            case "rebase":
+                await this.rebaseTracking(branchInfo);
+                return;
+            case "reset":
+                await this.resetTracking(branchInfo);
+                return;
+            default: {
+                const _exhaustive: never = method;
+                throw new Error(`Unknown sync method: ${String(_exhaustive)}`);
+            }
+        }
+    }
+
+    private async mergeTracking(branchInfo: BranchInfo): Promise<void> {
+        const mergeResult = await this.withAuthRetry(() =>
+            this.mutate(["merge", branchInfo.tracking!], {
+                ignoreErrors: true,
+            })
+        );
+        const conflicted = this.parseMergeConflicts(mergeResult.stderr);
+        if (conflicted.length > 0) {
+            await this.handleMergeConflicts(conflicted, branchInfo);
+        } else if (/Bad news:|\s\[-?\d+\]/m.test(mergeResult.stderr)) {
+            throw new Error(
+                `Pull failed (merge): ${mergeResult.stderr.trim()}`
+            );
+        }
+    }
+
+    private async rebaseTracking(branchInfo: BranchInfo): Promise<void> {
+        await this.syncIn();
+        try {
+            await rebaseOnto(
+                this.createRebaseHost(),
+                branchInfo.tracking!,
+                this.plugin.settings.mergeStrategy
+            );
+            this.app.workspace.trigger("obsidian-git:head-change");
+        } catch (error) {
+            if (error instanceof RebaseConflictError) {
+                this.plugin.localStorage.setConflict(true);
+                await this.syncOut();
+                await this.plugin.handleConflict(
+                    error.conflicted.map((path) =>
+                        this.getRelativeVaultPath(path)
+                    )
+                );
+                throw new Error(`Pull failed (rebase): ${error.message}`);
+            }
+            throw new Error(
+                `Pull failed (rebase): ${
+                    error instanceof Error ? error.message : String(error)
+                }`
+            );
+        } finally {
+            await this.syncOut();
+        }
+    }
+
+    private async resetTracking(branchInfo: BranchInfo): Promise<void> {
+        try {
+            await this.mutate(["reset", branchInfo.tracking!]);
+        } catch (error) {
+            throw new Error(
+                `Sync failed (reset): ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+        this.app.workspace.trigger("obsidian-git:head-change");
+    }
+
+    private createRebaseHost(): RebaseHost {
+        return {
+            listCommits: async (range) => {
+                const result = await this.lg2.run(
+                    MEM_ROOT,
+                    ["rev-list", range],
+                    { ignoreErrors: true }
+                );
+                return result.stdout
+                    .split("\n")
+                    .filter((line) => /^[0-9a-f]{40}$/.test(line))
+                    .reverse();
+            },
+            readCommit: async (hash) => {
+                const result = await this.lg2.run(
+                    MEM_ROOT,
+                    ["cat-file", "-p", hash],
+                    { ignoreErrors: true }
+                );
+                return parseCommitObject(result.stdout);
+            },
+            nameStatus: async (from, to) => {
+                const result = await this.lg2.run(
+                    MEM_ROOT,
+                    ["diff", "--name-status", from, to],
+                    { ignoreErrors: true }
+                );
+                return parseNameStatus(result.stdout);
+            },
+            readBlob: async (rev, path) => {
+                const result = await this.lg2.run(
+                    MEM_ROOT,
+                    ["cat-file", "-p", `${rev}:${path}`],
+                    { ignoreErrors: true }
+                );
+                if (containsLg2Error(result.stderr)) return undefined;
+                return result.stdout;
+            },
+            readWorktree: (path) => {
+                const memPath = `${MEM_ROOT}/${path}`;
+                if (!this.lg2.fs.analyzePath(memPath).exists) return undefined;
+                if (this.lg2.fs.isDir(this.lg2.fs.stat(memPath).mode)) {
+                    return undefined;
+                }
+                return this.lg2.fs.readFile(memPath, { encoding: "utf8" });
+            },
+            writeWorktree: (path, content) => {
+                const memPath = `${MEM_ROOT}/${path}`;
+                this.ensureMemDir(parentMemPath(memPath));
+                this.lg2.fs.writeFile(memPath, content);
+            },
+            unlinkWorktree: (path) => {
+                const memPath = `${MEM_ROOT}/${path}`;
+                if (this.lg2.fs.analyzePath(memPath).exists) {
+                    this.lg2.fs.unlink(memPath);
+                }
+            },
+            resetHard: async (rev) => {
+                const hard = await this.lg2.run(
+                    MEM_ROOT,
+                    ["reset", "--hard", rev],
+                    { ignoreErrors: true }
+                );
+                if (!containsLg2Error(hard.stderr)) return;
+                await this.lg2.run(MEM_ROOT, ["reset", rev]);
+                await this.lg2.run(MEM_ROOT, ["checkout", "--force", "HEAD"], {
+                    ignoreErrors: true,
+                });
+            },
+            add: async (paths) => {
+                await this.stageMemfsPaths(paths);
+            },
+            commit: async (message) => {
+                await this.lg2.run(MEM_ROOT, ["commit", "-m", message]);
+            },
+        };
     }
 
     private parseMergeConflicts(stderr: string): string[] {
@@ -1051,9 +1253,10 @@ export class WasmGit extends GitManager {
                         ).length;
                     }
                 }
-                await this.withAuthRetry(() =>
-                    this.mutate(["push"], { worktree: "none" })
-                );
+                await this.withAuthRetry(async () => {
+                    await this.uploadLfsForPush();
+                    return this.mutate(["push"], { worktree: "none" });
+                });
                 if (branchInfo.current && !branchInfo.tracking) {
                     // lg2's push always pushes the current branch to the
                     // same-named branch on origin; record that as upstream.
@@ -1746,8 +1949,10 @@ export class WasmGit extends GitManager {
         return Promise.resolve(undefined);
     }
 
-    async isFileTrackedByLFS(_filePath: string): Promise<boolean> {
-        return Promise.resolve(false);
+    async isFileTrackedByLFS(filePath: string): Promise<boolean> {
+        const repoPath = this.getRelativeRepoPath(filePath);
+        const rules = await this.readLfsAttributeRules();
+        return isLfsTracked(repoPath, rules);
     }
 
     async show(
@@ -1896,6 +2101,258 @@ export class WasmGit extends GitManager {
         return Promise.resolve();
     }
 
+    private async readLfsAttributeRules(): Promise<LfsAttributeRule[]> {
+        await this.ensureReady();
+        const rules: LfsAttributeRule[] = [];
+        const memAttributes = `${MEM_ROOT}/.gitattributes`;
+        if (this.lg2.fs.analyzePath(memAttributes).exists) {
+            rules.push(
+                ...parseGitAttributes(
+                    this.lg2.fs.readFile(memAttributes, { encoding: "utf8" })
+                )
+            );
+        } else {
+            const vaultPath =
+                this.plugin.settings.basePath === ""
+                    ? ".gitattributes"
+                    : `${this.plugin.settings.basePath}/.gitattributes`;
+            if (await this.adapter.exists(vaultPath)) {
+                const content = new TextDecoder().decode(
+                    await this.adapter.readBinary(vaultPath)
+                );
+                rules.push(...parseGitAttributes(content));
+            }
+        }
+        const infoAttributes = `${MEM_GITDIR}/info/attributes`;
+        if (this.lg2.fs.analyzePath(infoAttributes).exists) {
+            rules.push(
+                ...parseGitAttributes(
+                    this.lg2.fs.readFile(infoAttributes, {
+                        encoding: "utf8",
+                    })
+                )
+            );
+        }
+        return rules;
+    }
+
+    private listWorktreeFiles(): string[] {
+        const files: string[] = [];
+        const walk = (dir: string, relative: string): void => {
+            if (!this.lg2.fs.analyzePath(dir).exists) return;
+            for (const name of this.lg2.fs.readdir(dir)) {
+                if (name === "." || name === "..") continue;
+                if (relative === "" && name === ".git") continue;
+                const childRel = relative === "" ? name : `${relative}/${name}`;
+                const child = `${dir}/${name}`;
+                if (this.lg2.fs.isDir(this.lg2.fs.stat(child).mode)) {
+                    walk(child, childRel);
+                } else {
+                    files.push(childRel);
+                }
+            }
+        };
+        walk(MEM_ROOT, "");
+        return files;
+    }
+
+    private async smudgeLfsWorktree(): Promise<void> {
+        const rules = await this.readLfsAttributeRules();
+        if (rules.length === 0) return;
+        const pointers: { path: string; pointer: LfsPointer }[] = [];
+        for (const path of this.listWorktreeFiles()) {
+            if (!isLfsTracked(path, rules)) continue;
+            const memPath = `${MEM_ROOT}/${path}`;
+            if (!this.lg2.fs.analyzePath(memPath).exists) continue;
+            if (this.lg2.fs.isDir(this.lg2.fs.stat(memPath).mode)) continue;
+            const text = new TextDecoder().decode(
+                this.lg2.fs.readFile(memPath)
+            );
+            const pointer = parseLfsPointer(text);
+            if (pointer) pointers.push({ path, pointer });
+        }
+        if (pointers.length === 0) return;
+        const objects = await this.downloadLfsObjects(
+            pointers.map((entry) => entry.pointer)
+        );
+        for (const entry of pointers) {
+            const data = objects.get(entry.pointer.sha256);
+            if (data) {
+                this.lg2.fs.writeFile(`${MEM_ROOT}/${entry.path}`, data);
+            }
+        }
+    }
+
+    private async uploadLfsForPush(): Promise<void> {
+        await this.syncIn();
+        const pointers = await this.collectPushLfsPointers();
+        if (pointers.length === 0) return;
+        const endpoint = await this.getLfsBatchEndpoint();
+        if (endpoint == undefined) return;
+        const getAuth = () => this.httpBridge.getAuthHeader();
+        const batch = await lfsBatch(endpoint, "upload", pointers, getAuth);
+        for (const object of batch) {
+            if (object.error) {
+                throw new Error(
+                    `Git LFS upload failed for ${object.oid}: ${object.error.message}`
+                );
+            }
+            const upload = object.actions?.upload;
+            if (!upload) continue;
+            const pointer = pointers.find((item) => item.sha256 === object.oid);
+            if (!pointer) continue;
+            const body = this.readLfsObjectBytes(pointer);
+            if (!body) continue;
+            await lfsTransfer(
+                upload.href,
+                "PUT",
+                upload.header,
+                toArrayBuffer(body),
+                getAuth
+            );
+        }
+    }
+
+    private readLfsObjectBytes(pointer: LfsPointer): Uint8Array | undefined {
+        const rules = this.readLfsAttributeRulesSync();
+        for (const path of this.listWorktreeFiles()) {
+            if (!isLfsTracked(path, rules)) continue;
+            const memPath = `${MEM_ROOT}/${path}`;
+            if (!this.lg2.fs.analyzePath(memPath).exists) continue;
+            const data = this.lg2.fs.readFile(memPath);
+            if (hashLfsContent(data) === pointer.sha256) return data;
+        }
+        return undefined;
+    }
+
+    private readLfsAttributeRulesSync(): LfsAttributeRule[] {
+        const rules: LfsAttributeRule[] = [];
+        const memAttributes = `${MEM_ROOT}/.gitattributes`;
+        if (this.lg2.fs.analyzePath(memAttributes).exists) {
+            rules.push(
+                ...parseGitAttributes(
+                    this.lg2.fs.readFile(memAttributes, { encoding: "utf8" })
+                )
+            );
+        }
+        const infoAttributes = `${MEM_GITDIR}/info/attributes`;
+        if (this.lg2.fs.analyzePath(infoAttributes).exists) {
+            rules.push(
+                ...parseGitAttributes(
+                    this.lg2.fs.readFile(infoAttributes, {
+                        encoding: "utf8",
+                    })
+                )
+            );
+        }
+        return rules;
+    }
+
+    private async downloadLfsObjects(
+        pointers: LfsPointer[]
+    ): Promise<Map<string, Uint8Array>> {
+        const downloaded = new Map<string, Uint8Array>();
+        const endpoint = await this.getLfsBatchEndpoint();
+        if (endpoint == undefined) return downloaded;
+        const getAuth = () => this.httpBridge.getAuthHeader();
+        const unique = uniquePointers(pointers);
+        const batch = await lfsBatch(endpoint, "download", unique, getAuth);
+        for (const object of batch) {
+            if (object.error) {
+                throw new Error(
+                    `Git LFS download failed for ${object.oid}: ${object.error.message}`
+                );
+            }
+            const download = object.actions?.download;
+            if (!download) continue;
+            const data = await lfsTransfer(
+                download.href,
+                "GET",
+                download.header,
+                undefined,
+                getAuth
+            );
+            downloaded.set(object.oid, data);
+        }
+        return downloaded;
+    }
+
+    private async collectPushLfsPointers(): Promise<LfsPointer[]> {
+        const branchInfo = await this.branchInfo();
+        const range = branchInfo.tracking
+            ? `${branchInfo.tracking}..HEAD`
+            : "HEAD";
+        const listed = await this.lg2.run(MEM_ROOT, ["rev-list", range], {
+            ignoreErrors: true,
+        });
+        const hashes = listed.stdout
+            .split("\n")
+            .filter((line) => /^[0-9a-f]{40}$/.test(line));
+        const pointers = new Map<string, LfsPointer>();
+        for (const hash of hashes) {
+            const commit = parseCommitObject(
+                (
+                    await this.lg2.run(MEM_ROOT, ["cat-file", "-p", hash], {
+                        ignoreErrors: true,
+                    })
+                ).stdout
+            );
+            if (!commit) continue;
+            const parent = commit.parents[0];
+            const diff = await this.lg2.run(
+                MEM_ROOT,
+                parent
+                    ? ["diff", "--name-status", parent, hash]
+                    : ["diff", "--name-status", hash],
+                { ignoreErrors: true }
+            );
+            for (const file of parseNameStatus(diff.stdout)) {
+                if (file.type === "D") continue;
+                const blob = await this.lg2.run(
+                    MEM_ROOT,
+                    ["cat-file", "-p", `${hash}:${file.path}`],
+                    { ignoreErrors: true }
+                );
+                if (containsLg2Error(blob.stderr)) continue;
+                const pointer = parseLfsPointer(blob.stdout);
+                if (pointer) pointers.set(pointer.sha256, pointer);
+            }
+        }
+        return [...pointers.values()];
+    }
+
+    private async getLfsBatchEndpoint(): Promise<string | undefined> {
+        const remotes = parseRemoteVerbose(
+            (
+                await this.lg2.run(MEM_ROOT, ["remote", "show", "-v"], {
+                    ignoreErrors: true,
+                })
+            ).stdout
+        );
+        const remoteUrl = remotes.get("origin") ?? [...remotes.values()][0];
+        if (!remoteUrl) return undefined;
+        let configured: string | undefined;
+        const lfsConfig = `${MEM_ROOT}/.lfsconfig`;
+        if (this.lg2.fs.analyzePath(lfsConfig).exists) {
+            configured = parseLfsConfigUrl(
+                this.lg2.fs.readFile(lfsConfig, { encoding: "utf8" })
+            );
+        }
+        return lfsBatchEndpoint(remoteUrl, configured);
+    }
+
+    private ensureMemDir(path: string): void {
+        if (
+            path === "" ||
+            path === "/" ||
+            this.lg2.fs.analyzePath(path).exists
+        ) {
+            return;
+        }
+        this.ensureMemDir(parentMemPath(path));
+        this.lg2.fs.mkdir(path);
+    }
+
     /** Reads the staged blob for `repoPath`, or undefined if it is untracked. */
     private async readIndexFile(repoPath: string): Promise<string | undefined> {
         const listed = await this.readGitDir(["ls-files", "-s"], {
@@ -1952,6 +2409,25 @@ type StageOp =
     | { kind: "skip" }
     | { kind: "remove"; path: string }
     | { kind: "upsert"; entry: GitIndexEntry };
+
+function parentMemPath(path: string): string {
+    const index = path.lastIndexOf("/");
+    return index <= 0 ? "/" : path.substring(0, index);
+}
+
+function uniquePointers(pointers: LfsPointer[]): LfsPointer[] {
+    const unique = new Map<string, LfsPointer>();
+    for (const pointer of pointers) {
+        unique.set(pointer.sha256, pointer);
+    }
+    return [...unique.values()];
+}
+
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+    const copy = new Uint8Array(data.byteLength);
+    copy.set(data);
+    return copy.buffer;
+}
 
 function resetMemRepo(lg2: Lg2): void {
     if (lg2.fs.analyzePath(MEM_ROOT).exists) {
