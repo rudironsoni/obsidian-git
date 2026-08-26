@@ -1,0 +1,19 @@
+{
+    "name": "wasm-git",
+    "version": "0.0.17",
+    "type": "module",
+    "author": {
+        "name": "Peter Salomonsen",
+        "url": "https://petersalomonsen.com"
+    },
+    "repository": {
+        "url": "https://github.com/petersalomonsen/wasm-git"
+    },
+    "files": [
+        "lg2_async.js",
+        "lg2_async.wasm",
+        "lg2_opfs_auto.js",
+        "COPYING",
+        "SOURCE_COMMIT"
+    ]
+}
