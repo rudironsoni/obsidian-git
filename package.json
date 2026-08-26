@@ -7,6 +7,7 @@
         "dev": "node esbuild.config.mjs dev",
         "build": "node esbuild.config.mjs production",
         "release": "standard-version",
+        "update:wasm-git": "bash scripts/update-wasm-git.sh",
         "lint": "eslint src tests scripts e2e wdio.conf.mts vitest.config.ts",
         "format": "prettier --check src tests scripts e2e wdio.conf.mts vitest.config.ts",
         "tsc": "tsc --noEmit",
@@ -91,7 +92,7 @@
         "diff2html": "^3.4.56",
         "js-sha256": "^0.12.0",
         "svelte": "^5.56.8",
-        "wasm-git": "^0.0.17"
+        "wasm-git": "file:vendor/wasm-git"
     },
     "moduleFileExtensions": [
         "js",

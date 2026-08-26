@@ -45,8 +45,8 @@ importers:
         specifier: ^5.56.8
         version: 5.56.8(@typescript-eslint/types@8.65.0)
       wasm-git:
-        specifier: ^0.0.17
-        version: 0.0.17
+        specifier: file:vendor/wasm-git
+        version: file:vendor/wasm-git
     devDependencies:
       '@eslint/js':
         specifier: ^9.39.5
@@ -5028,8 +5028,8 @@ packages:
     engines: {node: '>=10'}
     hasBin: true
 
-  wasm-git@0.0.17:
-    resolution: {integrity: sha512-eAWLe2BQrx23t9jjffV5BkwbVW1c9nfUh4KDzPgMMKynNPGGTqztGYuJZY0x60hyO6clIn4eFUNkFnY535XtHw==}
+  wasm-git@file:vendor/wasm-git:
+    resolution: {directory: vendor/wasm-git, type: directory}
 
   wcwidth@1.0.1:
     resolution: {integrity: sha512-XHPEwS0q6TaxcvG85+8EYkbiCux2XtWG2mkc47Ng2A77BQu9+DqIOJldST4HgPkuea7dvKSj5VgX3P1d4rW8Tg==}
@@ -10728,7 +10728,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  wasm-git@0.0.17: {}
+  wasm-git@file:vendor/wasm-git: {}
 
   wcwidth@1.0.1:
     dependencies:
