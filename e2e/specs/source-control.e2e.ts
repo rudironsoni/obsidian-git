@@ -39,11 +39,22 @@ describe("obsidian-git smoke", function () {
     it("opens source control and lists a changed file", async function () {
         await waitForGitReady();
 
-        await browser.executeObsidian(async ({ app }) => {
+        await browser.executeObsidian(async ({ app }, pluginId) => {
             if (!(await app.vault.adapter.exists("Changed.md"))) {
                 await app.vault.create("Changed.md", "e2e change\n");
             }
-        });
+            const plugin = (
+                app as {
+                    plugins: {
+                        plugins: Record<
+                            string,
+                            { refresh?: () => Promise<void> }
+                        >;
+                    };
+                }
+            ).plugins.plugins[pluginId];
+            await plugin?.refresh?.();
+        }, PLUGIN_ID);
 
         await browser.executeObsidianCommand(OPEN_SOURCE_CONTROL);
 

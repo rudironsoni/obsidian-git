@@ -132,12 +132,9 @@
             status = undefined;
             return;
         }
-        if (Platform.isMobileApp) {
-            unPushedCommits = 0;
-        } else {
-            unPushedCommits = await plugin.gitManager.getUnpushedCommits();
-        }
-
+        // Paint status before unpushed-commit wasm. That read used to block
+        // the file list until lg2 init finished, so the e2e Changed.md row
+        // never appeared.
         status = plugin.cachedStatus;
         loading = false;
         if (
@@ -177,6 +174,15 @@
         } else {
             changeHierarchy = undefined;
             stagedHierarchy = undefined;
+        }
+        if (Platform.isMobileApp) {
+            unPushedCommits = 0;
+            return;
+        }
+        try {
+            unPushedCommits = await plugin.gitManager.getUnpushedCommits();
+        } catch {
+            unPushedCommits = 0;
         }
     }
 
