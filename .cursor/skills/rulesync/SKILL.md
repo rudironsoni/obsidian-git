@@ -15,7 +15,7 @@ description: Generates and syncs AI rule configuration files across coding tools
 
 ## Do not
 
--   Hand-edit `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or generated trees under `.cursor/` (except `.cursor/environment.json`), `.claude/`, `.codex/`, `.agent/`, `.agents/`, `.copilot/`, `.opencode/`, `.vscode/`.
+-   Hand-edit `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, or generated trees under `.cursor/` (except `.cursor/environment.json`), `.claude/`, `.codex/`, `.agent/`, `.agents/`, `.copilot/`, `.opencode/`, `.grok/`, `.vscode/`.
 -   Run `rulesync gitignore` in a way that ignores `AGENTS.md`; generated files stay tracked.
 -   Overwrite `.cursor/environment.json` or `scripts/cursor-cloud-install.sh`.
 

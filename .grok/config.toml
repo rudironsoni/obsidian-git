@@ -1,0 +1,8 @@
+[mcp_servers.wdio]
+command = "npx"
+args = [ "-y", "@wdio/mcp" ]
+
+[permission]
+allow = [ "Bash(* && echo \"EXIT:$?\")", "Bash(* && echo EXIT:*)", "Bash(* &&echo EXIT:*)", "Bash(*; echo \"EXIT:$?\")", "Bash(*; echo EXIT:*)", "Bash(*;echo EXIT:*)", "Bash(echo EXIT:*)", "Bash(pnpm install)", "Bash(pnpm run all)", "Bash(pnpm run build)", "Bash(pnpm run format)", "Bash(pnpm run lint)", "Bash(pnpm run rulesync:check)", "Bash(pnpm run rulesync:generate)", "Bash(pnpm run svelte)", "Bash(pnpm run test)", "Bash(pnpm run test:e2e)", "Bash(pnpm run tsc)", "Bash(pnpm run wdio:mcp)" ]
+deny = []
+ask = []
