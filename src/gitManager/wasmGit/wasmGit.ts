@@ -110,6 +110,12 @@ export class WasmGit extends GitManager {
     private gitDirLoaded = false;
     /** True after pack/loose objects have been paged into MEMFS. */
     private gitOdbLoaded = false;
+    /**
+     * In-flight {@link ensureReady}. Concurrent callers (Source Control
+     * `status-changed` plus the status bar `refreshed` listener) must share
+     * one lg2 init and one `.git` metadata `syncIn`. Two copies jetsam iOS.
+     */
+    private ensureReadyPromise: Promise<void> | undefined;
     private readonly noticeLength = 999_999;
     /**
      * Nested Git operations (commitAll → stageAll + commit) increment this
@@ -179,6 +185,19 @@ export class WasmGit extends GitManager {
     }
 
     private async ensureReady(): Promise<void> {
+        if (this.ensureReadyPromise) {
+            await this.ensureReadyPromise;
+            return;
+        }
+        this.ensureReadyPromise = this.ensureReadyInternal();
+        try {
+            await this.ensureReadyPromise;
+        } finally {
+            this.ensureReadyPromise = undefined;
+        }
+    }
+
+    private async ensureReadyInternal(): Promise<void> {
         this.plugin.crashLog?.log("ensureReady", {
             lg2: this.lg2.initialized,
             gitDirLoaded: this.gitDirLoaded,
@@ -208,6 +227,19 @@ export class WasmGit extends GitManager {
                 payloads: false,
             });
         }
+    }
+
+    /**
+     * Status, Source Control, and the status bar must not start wasm on
+     * iOS. `getUnpushedCommits` / `getLastCommitTime` used to call
+     * `ensureReady` after `computeStatus-done` and copy `.git` metadata
+     * into MEMFS, which jetsams the WebView. Commit, pull, and push still
+     * use wasm.
+     */
+    private skipMobileWasmRead(op: string): boolean {
+        if (!Platform.isMobileApp) return false;
+        this.plugin.crashLog?.log("skip-wasm-read", { op });
+        return true;
     }
 
     /**
@@ -1535,6 +1567,9 @@ export class WasmGit extends GitManager {
     }
 
     async getUnpushedCommits(): Promise<number> {
+        if (this.skipMobileWasmRead("getUnpushedCommits")) {
+            return 0;
+        }
         const branchInfo = await this.branchInfo();
         if (!branchInfo.current || !branchInfo.tracking) {
             return 0;
@@ -2012,6 +2047,9 @@ export class WasmGit extends GitManager {
     }
 
     async getLastCommitTime(): Promise<Date | undefined> {
+        if (this.skipMobileWasmRead("getLastCommitTime")) {
+            return undefined;
+        }
         const head = await this.revParse("HEAD");
         if (!head) return undefined;
         const commit = await this.catFileCommit(head);
@@ -2610,6 +2648,7 @@ export class WasmGit extends GitManager {
         this.gitDirMirror = undefined;
         this.gitDirLoaded = false;
         this.gitOdbLoaded = false;
+        this.ensureReadyPromise = undefined;
     }
 
     private reportError(error: unknown): void {

@@ -132,7 +132,11 @@
             status = undefined;
             return;
         }
-        unPushedCommits = await plugin.gitManager.getUnpushedCommits();
+        if (Platform.isMobileApp) {
+            unPushedCommits = 0;
+        } else {
+            unPushedCommits = await plugin.gitManager.getUnpushedCommits();
+        }
 
         status = plugin.cachedStatus;
         loading = false;

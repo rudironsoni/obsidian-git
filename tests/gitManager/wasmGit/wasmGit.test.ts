@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { describe, expect, it, vi } from "vitest";
+import { Platform } from "obsidian";
 import { WasmGit } from "../../../src/gitManager/wasmGit/wasmGit";
 import { Lg2Error } from "../../../src/gitManager/wasmGit/lg2";
 import {
@@ -717,6 +718,38 @@ describe("WasmGit gitdir-only reads", () => {
         for (const call of list.mock.calls) {
             expect(call[0]).toMatch(/^\.git(\/|$)/);
         }
+    });
+
+    it("does not start wasm for unpushed or last-commit reads on mobile", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        Platform.isMobileApp = true;
+        try {
+            expect(await vault.manager.getUnpushedCommits()).toBe(0);
+            expect(await vault.manager.getLastCommitTime()).toBeUndefined();
+        } finally {
+            Platform.isMobileApp = false;
+        }
+        const events = vault.plugin.crashLog.log.mock.calls.map((call) =>
+            String(call[0])
+        );
+        expect(events).toContain("skip-wasm-read");
+        expect(events).not.toContain("lg2-init-start");
+        expect(events).not.toContain("ensureReady");
+    });
+
+    it("shares one lg2 init when ensureReady races", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        await Promise.all([
+            vault.manager.branchInfo(),
+            vault.manager.branchInfo(),
+        ]);
+        const inits = vault.plugin.crashLog.log.mock.calls.filter(
+            (call) => String(call[0]) === "lg2-init-start"
+        );
+        expect(inits).toHaveLength(1);
+        expect((await vault.manager.branchInfo()).current).toBe("main");
     });
 });
 

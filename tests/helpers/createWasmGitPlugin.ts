@@ -11,6 +11,7 @@ export type WasmGitFakePlugin = ObsidianGit & {
     log: ReturnType<typeof vi.fn>;
     displayError: ReturnType<typeof vi.fn>;
     handleConflict: ReturnType<typeof vi.fn>;
+    crashLog: { log: ReturnType<typeof vi.fn> };
     /** In-memory backing store of the localStorage fake. */
     storage: Map<string, string>;
 };
