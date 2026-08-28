@@ -41,8 +41,13 @@ import {
     writeGitIndex,
     type GitIndexEntry,
 } from "./gitIndex";
-import { runPool, writeGitLooseBlob } from "./gitObject";
-import type { ParsedCommitObject } from "./parsers";
+import {
+    inflateGitObject,
+    parseGitTree,
+    runPool,
+    writeGitLooseBlob,
+} from "./gitObject";
+import type { ParsedCommitObject, ParsedNameStatusEntry } from "./parsers";
 import {
     applyUnifiedPatch,
     extractFileDiff,
@@ -388,14 +393,12 @@ export class WasmGit extends GitManager {
 
     /**
      * Builds a {@link Status} from the git index, vault metadata, and
-     * per-file hashes of the files that might have changed. The working
-     * tree is never copied into MEMFS, so this stays bounded by the `.git`
-     * directory plus one file at a time — the difference between a usable
-     * plugin and an iOS jetsam kill on launch.
+     * per-file hashes of the files that might have changed. Does not start
+     * wasm or copy `.git` into MEMFS: that path jetsams iOS on refresh/sync.
      */
     private async computeStatus(pathFilter?: string): Promise<Status> {
-        await this.ensureReady();
-        const indexEntries = this.readIndexEntries();
+        this.plugin.crashLog?.log("computeStatus");
+        const indexEntries = await this.readIndexEntriesFromVault();
         const index = new Map(
             indexEntries
                 .filter((entry) => entry.stage === 0 && !isGitlink(entry.mode))
@@ -410,12 +413,11 @@ export class WasmGit extends GitManager {
         ];
 
         const ignore = new GitIgnore();
-        const excludePath = `${MEM_GITDIR}/info/exclude`;
-        if (this.lg2.fs.analyzePath(excludePath).exists) {
-            ignore.addFile(
-                "",
-                this.lg2.fs.readFile(excludePath, { encoding: "utf8" })
-            );
+        const excludePath = normalizePath(
+            `${this.getGitDirVaultPath()}/info/exclude`
+        );
+        if (await this.adapter.exists(excludePath)) {
+            ignore.addFile("", await this.readVaultText(excludePath));
         }
 
         const trackedDirs = new Set<string>();
@@ -445,13 +447,10 @@ export class WasmGit extends GitManager {
             hashFile: (repoPath) => this.hashVaultFile(repoPath),
         });
         const untracked = collectUntracked(vaultFiles, index);
+        const staged = await this.diffIndexToHead(index);
 
-        const cached = await this.readGitDir(
-            ["diff", "--name-status", "--cached"],
-            { ignoreErrors: true }
-        );
         return composeStatus({
-            staged: parseNameStatus(cached.stdout),
+            staged,
             modified,
             deleted,
             untracked,
@@ -461,10 +460,134 @@ export class WasmGit extends GitManager {
         });
     }
 
+    private async readIndexEntriesFromVault(): Promise<GitIndexEntry[]> {
+        const indexPath = normalizePath(`${this.getGitDirVaultPath()}/index`);
+        if (!(await this.adapter.exists(indexPath))) return [];
+        try {
+            return parseGitIndex(
+                new Uint8Array(await this.adapter.readBinary(indexPath))
+            );
+        } catch {
+            return [];
+        }
+    }
+
     private readIndexEntries() {
         const indexPath = `${MEM_GITDIR}/index`;
         if (!this.lg2.fs.analyzePath(indexPath).exists) return [];
         return parseGitIndex(this.lg2.fs.readFile(indexPath));
+    }
+
+    /**
+     * Index vs HEAD using loose objects only. Packed HEAD trees return []
+     * rather than copying packs into MEMFS.
+     */
+    private async diffIndexToHead(
+        index: Map<string, GitIndexEntry>
+    ): Promise<ParsedNameStatusEntry[]> {
+        const head = await this.readHeadBlobMap();
+        if (head == undefined) return [];
+        const staged: ParsedNameStatusEntry[] = [];
+        for (const [path, entry] of index) {
+            const previous = head.get(path);
+            if (previous == undefined) {
+                staged.push({ type: "A", path });
+            } else if (previous !== entry.hash) {
+                staged.push({ type: "M", path });
+            }
+        }
+        for (const path of head.keys()) {
+            if (!index.has(path)) {
+                staged.push({ type: "D", path });
+            }
+        }
+        return staged;
+    }
+
+    private async readHeadBlobMap(): Promise<Map<string, string> | undefined> {
+        const commitHash = await this.resolveHeadCommitHash();
+        if (commitHash == undefined) return undefined;
+        const commit = await this.readLooseObject(commitHash);
+        if (commit == undefined || commit.type !== "commit") {
+            this.plugin.crashLog?.log("status-head-packed");
+            return undefined;
+        }
+        const parsed = parseCommitObject(
+            new TextDecoder("utf-8").decode(commit.payload)
+        );
+        if (parsed == undefined) return undefined;
+        const blobs = new Map<string, string>();
+        const ok = await this.walkLooseTree(parsed.tree, "", blobs);
+        return ok ? blobs : undefined;
+    }
+
+    private async resolveHeadCommitHash(): Promise<string | undefined> {
+        const headPath = normalizePath(`${this.getGitDirVaultPath()}/HEAD`);
+        if (!(await this.adapter.exists(headPath))) return undefined;
+        const head = (await this.readVaultText(headPath)).trim();
+        const ref = head.match(/^ref:\s+(.*)$/)?.[1];
+        if (!ref) {
+            return /^[0-9a-f]{40}$/i.test(head)
+                ? head.toLowerCase()
+                : undefined;
+        }
+        const refPath = normalizePath(`${this.getGitDirVaultPath()}/${ref}`);
+        if (await this.adapter.exists(refPath)) {
+            const value = (await this.readVaultText(refPath)).trim();
+            return /^[0-9a-f]{40}$/i.test(value)
+                ? value.toLowerCase()
+                : undefined;
+        }
+        const packedPath = normalizePath(
+            `${this.getGitDirVaultPath()}/packed-refs`
+        );
+        if (!(await this.adapter.exists(packedPath))) return undefined;
+        const packed = await this.readVaultText(packedPath);
+        for (const line of packed.split("\n")) {
+            if (line.startsWith("#") || line.startsWith("^")) continue;
+            const match = line.match(/^([0-9a-f]{40})\s+(\S+)$/i);
+            if (match?.[2] === ref) return match[1]!.toLowerCase();
+        }
+        return undefined;
+    }
+
+    private async walkLooseTree(
+        hash: string,
+        prefix: string,
+        blobs: Map<string, string>
+    ): Promise<boolean> {
+        const object = await this.readLooseObject(hash);
+        if (object == undefined || object.type !== "tree") {
+            this.plugin.crashLog?.log("status-head-packed");
+            return false;
+        }
+        for (const entry of parseGitTree(object.payload)) {
+            const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+            if ((entry.mode & 0o170000) === 0o040000) {
+                if (!(await this.walkLooseTree(entry.hash, path, blobs))) {
+                    return false;
+                }
+            } else if ((entry.mode & 0o170000) !== 0o160000) {
+                blobs.set(path, entry.hash);
+            }
+        }
+        return true;
+    }
+
+    private async readLooseObject(
+        hash: string
+    ): Promise<{ type: string; payload: Uint8Array } | undefined> {
+        const objectPath = normalizePath(
+            `${this.getGitDirVaultPath()}/objects/${hash.slice(0, 2)}/${hash.slice(2)}`
+        );
+        if (!(await this.adapter.exists(objectPath))) return undefined;
+        try {
+            return await inflateGitObject(
+                new Uint8Array(await this.adapter.readBinary(objectPath))
+            );
+        } catch {
+            return undefined;
+        }
     }
 
     private async readVaultText(vaultPath: string): Promise<string> {

@@ -44,6 +44,19 @@ export async function writeGitLooseBlob(
     return hash;
 }
 
+export async function zlibInflate(data: Uint8Array): Promise<Uint8Array> {
+    const stream = new DecompressionStream("deflate");
+    const writer = stream.writable.getWriter();
+    try {
+        await writer.write(data);
+        await writer.close();
+    } catch (error) {
+        writer.abort(error).catch(() => undefined);
+        throw error;
+    }
+    return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+}
+
 export async function zlibDeflate(data: Uint8Array): Promise<Uint8Array> {
     const stream = new CompressionStream("deflate");
     const writer = stream.writable.getWriter();
@@ -74,6 +87,63 @@ export function fromHex(hex: string): Uint8Array {
         bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
     }
     return bytes;
+}
+
+export interface InflatedGitObject {
+    type: string;
+    payload: Uint8Array;
+}
+
+export async function inflateGitObject(
+    compressed: Uint8Array
+): Promise<InflatedGitObject> {
+    const store = await zlibInflate(compressed);
+    let split = -1;
+    for (let i = 0; i < store.byteLength; i++) {
+        if (store[i] === 0) {
+            split = i;
+            break;
+        }
+    }
+    if (split < 0) {
+        throw new Error("git object is missing a header");
+    }
+    const header = new TextDecoder("utf-8").decode(store.subarray(0, split));
+    const space = header.indexOf(" ");
+    const type = space === -1 ? header : header.slice(0, space);
+    return { type, payload: store.subarray(split + 1) };
+}
+
+export interface GitTreeEntry {
+    mode: number;
+    name: string;
+    hash: string;
+}
+
+export function parseGitTree(payload: Uint8Array): GitTreeEntry[] {
+    const entries: GitTreeEntry[] = [];
+    let offset = 0;
+    const decoder = new TextDecoder("utf-8");
+    while (offset < payload.byteLength) {
+        let space = offset;
+        while (space < payload.byteLength && payload[space] !== 0x20) {
+            space += 1;
+        }
+        let nul = space;
+        while (nul < payload.byteLength && payload[nul] !== 0) {
+            nul += 1;
+        }
+        if (nul + 20 >= payload.byteLength) break;
+        const mode = Number.parseInt(
+            decoder.decode(payload.subarray(offset, space)),
+            8
+        );
+        const name = decoder.decode(payload.subarray(space + 1, nul));
+        const hash = toHex(payload.subarray(nul + 1, nul + 21));
+        entries.push({ mode, name, hash });
+        offset = nul + 21;
+    }
+    return entries;
 }
 
 function ensureDir(fs: MemDirFs, path: string): void {

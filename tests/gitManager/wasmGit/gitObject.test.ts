@@ -3,10 +3,14 @@ import {
     fromHex,
     gitBlobStore,
     hashGitBlob,
+    inflateGitObject,
+    parseGitTree,
     runPool,
     sha1Hex,
     toHex,
     writeGitLooseBlob,
+    zlibDeflate,
+    zlibInflate,
 } from "../../../src/gitManager/wasmGit/gitObject";
 
 describe("hashGitBlob", () => {
@@ -28,6 +32,35 @@ describe("gitBlobStore", () => {
         const store = gitBlobStore(new Uint8Array([1, 2, 3]));
         expect(new TextDecoder().decode(store.subarray(0, 7))).toBe("blob 3\0");
         expect([...store.subarray(7)]).toEqual([1, 2, 3]);
+    });
+});
+
+describe("zlib and git objects", () => {
+    it("round-trips deflate/inflate", async () => {
+        const input = new TextEncoder().encode("payload");
+        expect(await zlibInflate(await zlibDeflate(input))).toEqual(input);
+    });
+
+    it("inflates a loose blob object", async () => {
+        const store = gitBlobStore(new TextEncoder().encode("hi"));
+        const inflated = await inflateGitObject(await zlibDeflate(store));
+        expect(inflated.type).toBe("blob");
+        expect(new TextDecoder().decode(inflated.payload)).toBe("hi");
+    });
+
+    it("parses a git tree", () => {
+        const hash = fromHex("0123456789abcdef0123456789abcdef01234567");
+        const prefix = new TextEncoder().encode("100644 file\0");
+        const payload = new Uint8Array(prefix.byteLength + 20);
+        payload.set(prefix);
+        payload.set(hash, prefix.byteLength);
+        expect(parseGitTree(payload)).toEqual([
+            {
+                mode: 0o100644,
+                name: "file",
+                hash: "0123456789abcdef0123456789abcdef01234567",
+            },
+        ]);
     });
 });
 
