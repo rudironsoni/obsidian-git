@@ -720,6 +720,17 @@ describe("WasmGit gitdir-only reads", () => {
         }
     });
 
+    it("reads the current branch from HEAD without wasm", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        expect(await vault.manager.readCurrentBranchFromVault()).toBe("main");
+        const events = vault.plugin.crashLog.log.mock.calls.map((call) =>
+            String(call[0])
+        );
+        expect(events).not.toContain("lg2-init-start");
+        expect(events).not.toContain("ensureReady");
+    });
+
     it("does not start wasm for unpushed or last-commit reads on mobile", async () => {
         const vault = createVault();
         await seedRepo(vault);

@@ -13,9 +13,10 @@ export class BranchStatusBar {
 
     async display() {
         if (this.plugin.gitReady) {
-            const branchInfo = await this.plugin.gitManager.branchInfo();
-            if (branchInfo.current != undefined) {
-                this.statusBarEl.setText(branchInfo.current);
+            const current =
+                await this.plugin.gitManager.readCurrentBranchFromVault();
+            if (current != undefined) {
+                this.statusBarEl.setText(current);
             } else {
                 this.statusBarEl.empty();
             }

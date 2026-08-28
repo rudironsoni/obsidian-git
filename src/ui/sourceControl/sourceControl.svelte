@@ -176,20 +176,7 @@
             changeHierarchy = undefined;
             stagedHierarchy = undefined;
         }
-        if (Platform.isMobileApp) {
-            unPushedCommits = 0;
-            return;
-        }
-        window.setTimeout(() => {
-            void plugin.gitManager
-                .getUnpushedCommits()
-                .then((n) => {
-                    unPushedCommits = n;
-                })
-                .catch(() => {
-                    unPushedCommits = 0;
-                });
-        }, 0);
+        unPushedCommits = 0;
     }
 
     function triggerRefresh() {

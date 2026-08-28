@@ -110,16 +110,15 @@ export default class ObsidianGit extends Plugin {
         this.cachedStatus = await this.gitManager.status();
         if (this.cachedStatus.conflicted.length > 0) {
             this.localStorage.setConflict(true);
-            await this.branchBar?.display();
         } else {
             this.localStorage.setConflict(false);
-            await this.branchBar?.display();
         }
 
         this.app.workspace.trigger(
             "obsidian-git:status-changed",
             this.cachedStatus
         );
+        await this.branchBar?.display();
         return this.cachedStatus;
     }
 

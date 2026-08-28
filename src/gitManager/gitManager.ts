@@ -1,5 +1,5 @@
 import { hostname as osHostname } from "os";
-import { type App, moment, Platform } from "obsidian";
+import { type App, moment, normalizePath, Platform } from "obsidian";
 import type ObsidianGit from "../main";
 import { GitOperation } from "../types";
 import type {
@@ -179,6 +179,26 @@ export abstract class GitManager {
     ): Promise<{ submodule: string; relativeFilepath: string } | undefined>;
 
     abstract isFileTrackedByLFS(filePath: string): Promise<boolean>;
+
+    /**
+     * Current branch from `.git/HEAD`. Does not start wasm. Status and the
+     * branch status bar use this so a refresh cannot copy `.git` into MEMFS.
+     */
+    async readCurrentBranchFromVault(): Promise<string | undefined> {
+        const gitDir = this.getRelativeVaultPath(
+            this.plugin.settings.gitDir || ".git"
+        );
+        const headPath = normalizePath(`${gitDir}/HEAD`);
+        try {
+            if (!(await this.app.vault.adapter.exists(headPath))) {
+                return undefined;
+            }
+            const head = (await this.app.vault.adapter.read(headPath)).trim();
+            return head.match(/^ref: refs\/heads\/(.*)$/)?.[1];
+        } catch {
+            return undefined;
+        }
+    }
 
     // Constructs a path relative to the vault from a path relative to the git repository
     getRelativeVaultPath(path: string): string {
