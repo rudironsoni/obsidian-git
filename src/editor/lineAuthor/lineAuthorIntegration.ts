@@ -1,6 +1,6 @@
 import type { Extension } from "@codemirror/state";
 import type { EventRef, TAbstractFile, WorkspaceLeaf } from "obsidian";
-import { MarkdownView, TFile } from "obsidian";
+import { MarkdownView, Platform, TFile } from "obsidian";
 import type { GitManager } from "src/gitManager/gitManager";
 import {
     LineAuthorProvider,
@@ -45,6 +45,7 @@ export class LineAuthoringFeature {
     }
 
     public conditionallyActivateBySettings() {
+        if (Platform.isMobileApp) return;
         if (this.plg.settings.lineAuthor.show) {
             this.activateFeature();
         }

@@ -1,6 +1,6 @@
 import type { Extension } from "@codemirror/state";
 import type { EventRef, WorkspaceLeaf } from "obsidian";
-import { MarkdownView, TFile } from "obsidian";
+import { MarkdownView, Platform, TFile } from "obsidian";
 import type { GitManager } from "src/gitManager/gitManager";
 import type ObsidianGit from "src/main";
 import {
@@ -34,6 +34,7 @@ export class SignsFeature {
     }
 
     public conditionallyActivateBySettings() {
+        if (Platform.isMobileApp) return;
         if (
             this.plg.settings.hunks.showSigns ||
             this.plg.settings.hunks.statusBar != "disabled" ||

@@ -167,8 +167,14 @@ export class WasmGit extends GitManager {
     }
 
     private async ensureReady(): Promise<void> {
+        this.plugin.crashLog.log("ensureReady", {
+            lg2: this.lg2.initialized,
+            gitDirLoaded: this.gitDirLoaded,
+        });
         if (!this.lg2.initialized) {
+            this.plugin.crashLog.log("lg2-init-start");
             await this.lg2.init();
+            this.plugin.crashLog.log("lg2-init-done");
             // A WASM trap unloads the module and invalidates any FS handles
             // the mirrors still hold, so they must be rebuilt from scratch.
             this.discardMirrors();
@@ -179,9 +185,11 @@ export class WasmGit extends GitManager {
         if (!this.gitDirLoaded) {
             // The .git directory is loaded once per session and treated as
             // owned by this engine afterwards; only git itself modifies it.
+            this.plugin.crashLog.log("gitDir-syncIn-start");
             await this.gitDirMirror!.syncIn();
             this.gitDirLoaded = true;
             await this.normalizeRepoConfig();
+            this.plugin.crashLog.log("gitDir-syncIn-done");
         }
     }
 

@@ -54,10 +54,12 @@
                 () => void refresh().catch(console.error)
             )
         );
-        if (view.plugin.cachedStatus == undefined) {
-            view.plugin.refresh().catch(console.error);
-        } else {
-            refresh().catch(console.error);
+        if (!Platform.isMobileApp) {
+            if (view.plugin.cachedStatus == undefined) {
+                view.plugin.refresh().catch(console.error);
+            } else {
+                refresh().catch(console.error);
+            }
         }
 
         view.scope = new Scope(plugin.app.scope);

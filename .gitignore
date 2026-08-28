@@ -13,6 +13,12 @@ yarn.lock
 # WDIO / Obsidian launcher cache and vault git created at E2E runtime
 .obsidian-cache
 e2e/vaults/**/.git
+tests/test-vault/.git
+tests/test-vault/.obsidian/workspace.json
+tests/test-vault/.obsidian/workspace-mobile.json
+tests/test-vault/.obsidian/plugins/obsidian-git/main.js
+obsidian-git-crash.log
+tests/test-vault/obsidian-git-crash.log
 obsidian-versions-lock.txt
 
 .prettierignore

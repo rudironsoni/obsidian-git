@@ -63,6 +63,7 @@ import {
 import { DiscardModal, type DiscardResult } from "./ui/modals/discardModal";
 import { HunkActions } from "./editor/signs/hunkActions";
 import { EditorIntegration } from "./editor/editorIntegration";
+import { CrashLog } from "./crashLog";
 
 export default class ObsidianGit extends Plugin {
     gitManager!: GitManager;
@@ -91,6 +92,7 @@ export default class ObsidianGit extends Plugin {
     intervalsToClear: number[] = [];
     editorIntegration: EditorIntegration = new EditorIntegration(this);
     hunkActions = new HunkActions(this);
+    crashLog = new CrashLog(this);
 
     /**
      * Debouncer for the refresh of the git status for the source control view after file changes.
@@ -103,6 +105,7 @@ export default class ObsidianGit extends Plugin {
     }
 
     async updateCachedStatus(): Promise<Status> {
+        this.crashLog.log("updateCachedStatus");
         this.app.workspace.trigger("obsidian-git:loading-status");
         this.cachedStatus = await this.gitManager.status();
         if (this.cachedStatus.conflicted.length > 0) {
@@ -121,6 +124,7 @@ export default class ObsidianGit extends Plugin {
     }
 
     async refresh() {
+        this.crashLog.log("refresh", { gitReady: this.gitReady });
         if (!this.gitReady) return;
 
         const gitViews = this.app.workspace.getLeavesOfType(
@@ -154,24 +158,70 @@ export default class ObsidianGit extends Plugin {
                 " plugin: v" +
                 this.manifest.version
         );
+        this.crashLog.log("onload", {
+            version: this.manifest.version,
+            isMobileApp: Platform.isMobileApp,
+            isIosApp: Platform.isIosApp,
+        });
+        const onWindowError = (event: ErrorEvent): void => {
+            this.crashLog.log("window.error", {
+                message: event.message,
+                filename: event.filename,
+                lineno: event.lineno,
+            });
+        };
+        const onUnhandledRejection = (event: PromiseRejectionEvent): void => {
+            const reason: unknown = event.reason;
+            this.crashLog.log("unhandledrejection", {
+                message:
+                    reason instanceof Error
+                        ? reason.message
+                        : typeof reason === "string"
+                          ? reason
+                          : "non-error",
+            });
+        };
+        window.addEventListener("error", onWindowError);
+        window.addEventListener("unhandledrejection", onUnhandledRejection);
+        this.register(() => {
+            window.removeEventListener("error", onWindowError);
+            window.removeEventListener(
+                "unhandledrejection",
+                onUnhandledRejection
+            );
+        });
 
         pluginRef.plugin = this;
 
         this.localStorage.migrate();
         await this.loadSettings();
         await this.migrateSettings();
+        this.crashLog.log("settings-loaded", {
+            autoPullOnBoot: this.settings.autoPullOnBoot,
+            refreshSourceControl: this.settings.refreshSourceControl,
+            lineAuthorShow: this.settings.lineAuthor.show,
+            pluginDisabled: this.localStorage.getPluginDisabled(),
+        });
 
         this.settingsTab = new ObsidianGitSettingsTab(this.app, this);
         this.addSettingTab(this.settingsTab);
 
         if (!this.localStorage.getPluginDisabled()) {
+            this.crashLog.log("registerStuff");
             this.registerStuff();
+            this.crashLog.log("registerStuff-done");
 
-            this.app.workspace.onLayoutReady(() =>
-                this.init({ fromReload: false }).catch((e) =>
-                    this.displayError(e)
-                )
-            );
+            this.app.workspace.onLayoutReady(() => {
+                this.crashLog.log("layout-ready");
+                this.init({ fromReload: false }).catch((e) => {
+                    this.crashLog.log("init-error", {
+                        message: e instanceof Error ? e.message : String(e),
+                    });
+                    this.displayError(e);
+                });
+            });
+        } else {
+            this.crashLog.log("plugin-disabled-on-device");
         }
     }
 
@@ -329,7 +379,10 @@ export default class ObsidianGit extends Plugin {
         this.debRefresh?.cancel();
         this.debRefresh = debounce(
             () => {
-                if (this.settings.refreshSourceControl) {
+                if (
+                    this.settings.refreshSourceControl &&
+                    !Platform.isMobileApp
+                ) {
                     this.refresh().catch(console.error);
                 }
             },
@@ -499,6 +552,7 @@ export default class ObsidianGit extends Plugin {
     }
 
     unloadPlugin() {
+        this.crashLog.log("unloadPlugin", { gitReady: this.gitReady });
         this.gitReady = false;
 
         this.editorIntegration.onUnloadPlugin();
@@ -507,7 +561,7 @@ export default class ObsidianGit extends Plugin {
         this.statusBar?.remove();
         this.statusBar = undefined;
         this.branchBar = undefined;
-        this.gitManager.unload();
+        this.gitManager?.unload();
         this.promiseQueue.clear();
 
         for (const interval of this.intervalsToClear) {
@@ -515,10 +569,11 @@ export default class ObsidianGit extends Plugin {
         }
         this.intervalsToClear = [];
 
-        this.debRefresh.cancel();
+        this.debRefresh?.cancel();
     }
 
     onunload() {
+        this.crashLog.log("onunload");
         this.unloadPlugin();
 
         console.log("unloading " + this.manifest.name + " plugin");
@@ -540,9 +595,11 @@ export default class ObsidianGit extends Plugin {
     }
 
     async init({ fromReload = false }): Promise<void> {
+        this.crashLog.log("init", { fromReload });
         if (this.localStorage.getPluginDisabled()) {
             // This is already guarded in `onload`, but we also guard here to
             // avoid any issues if `init` is called directly.
+            this.crashLog.log("init-skipped-disabled");
             return;
         }
         if (this.settings.showStatusBar && !this.statusBar) {
@@ -557,6 +614,7 @@ export default class ObsidianGit extends Plugin {
             this.gitManager = new WasmGit(this);
 
             const result = await this.gitManager.checkRequirements();
+            this.crashLog.log("checkRequirements", { result });
             const pausedAutomatics = this.localStorage.getPausedAutomatics();
             switch (result) {
                 case "missing-git":
@@ -572,6 +630,7 @@ export default class ObsidianGit extends Plugin {
                     break;
                 case "valid":
                     this.gitReady = true;
+                    this.crashLog.log("gitReady");
 
                     if (
                         Platform.isDesktop &&
@@ -596,6 +655,16 @@ export default class ObsidianGit extends Plugin {
                     await this.branchBar?.display();
 
                     this.editorIntegration.onReady();
+
+                    // Mobile: do not copy `.git` into MEMFS or talk to remotes
+                    // during boot. Restored Source Control / History views and
+                    // desktop-synced auto-pull settings were restarting the
+                    // iOS WebView in a load loop.
+                    if (Platform.isMobileApp) {
+                        this.log("Skipping boot git work on mobile.");
+                        this.crashLog.log("skip-boot-git-work");
+                        break;
+                    }
 
                     this.app.workspace.trigger("obsidian-git:refresh");
                     /// Among other things, this notifies the history view that git is ready
@@ -627,6 +696,9 @@ export default class ObsidianGit extends Plugin {
                     );
             }
         } catch (error) {
+            this.crashLog.log("init-catch", {
+                message: error instanceof Error ? error.message : String(error),
+            });
             this.displayError(error);
             console.error(error);
         }
@@ -1584,6 +1656,7 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
         if (this.settings.showErrorNotices) {
             new Notice(error.message, timeout);
         }
+        this.crashLog.log("displayError", { message: error.message });
         console.error(`${this.manifest.id}:`, error.stack);
         this.statusBar?.displayMessage(error.message.toLowerCase(), timeout);
     }

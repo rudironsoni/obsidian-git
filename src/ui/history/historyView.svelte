@@ -54,7 +54,9 @@
         };
     });
 
-    refresh().catch(console.error);
+    if (!Platform.isMobileApp) {
+        refresh().catch(console.error);
+    }
 
     function triggerRefresh() {
         refresh().catch(console.error);
