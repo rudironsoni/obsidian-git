@@ -29,6 +29,7 @@ DIRS = [
     ".agents",
     ".copilot",
     ".opencode",
+    ".grok",
     ".github/agents",
     ".github/skills",
     ".github/prompts",

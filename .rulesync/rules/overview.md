@@ -8,7 +8,7 @@ globs: ["**/*"]
 
 Edit `.rulesync/` (and `rulesync.jsonc`) only. Generated files such as
 `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`, `.cursor/skills/`, `.claude/`,
-`.codex/`, and `.github/copilot-instructions.md` are produced by
+`.codex/`, `.grok/`, and `.github/copilot-instructions.md` are produced by
 `pnpm run rulesync:generate` in CI. Do not hand-edit those outputs.
 
 Keep `.cursor/environment.json` and `scripts/cursor-cloud-install.sh` as
