@@ -1,4 +1,4 @@
-import { Notice, normalizePath } from "obsidian";
+import { Notice, normalizePath, Platform } from "obsidian";
 import type ObsidianGit from "../../main";
 import type {
     Blame,
@@ -75,6 +75,7 @@ import {
     diffWorktreeAgainstIndex,
     hashGitBlob,
     walkWorktreeMeta,
+    type VaultFileMeta,
 } from "./worktreeStatus";
 
 const MEM_ROOT = "/repo";
@@ -398,7 +399,13 @@ export class WasmGit extends GitManager {
      */
     private async computeStatus(pathFilter?: string): Promise<Status> {
         this.plugin.crashLog?.log("computeStatus");
+        if (Platform.isMobileApp) {
+            new Notice("Git: checking status…", 5000);
+        }
         const indexEntries = await this.readIndexEntriesFromVault();
+        this.plugin.crashLog?.log("computeStatus-index", {
+            entries: indexEntries.length,
+        });
         const index = new Map(
             indexEntries
                 .filter((entry) => entry.stage === 0 && !isGitlink(entry.mode))
@@ -428,26 +435,45 @@ export class WasmGit extends GitManager {
             }
         }
 
-        const vaultFiles = await walkWorktreeMeta(
-            this.adapter,
-            this.plugin.settings.basePath,
-            {
-                exclude: (relativePath) =>
-                    this.isExcludedWorktreePath(relativePath),
-                ignore,
-                keep: (relativePath) =>
-                    index.has(relativePath) || trackedDirs.has(relativePath),
-                readText: (vaultPath) => this.readVaultText(vaultPath),
-            }
-        );
+        const vaultFiles = Platform.isMobileApp
+            ? await this.statTrackedVaultFiles(index)
+            : await walkWorktreeMeta(
+                  this.adapter,
+                  this.plugin.settings.basePath,
+                  {
+                      exclude: (relativePath) =>
+                          this.isExcludedWorktreePath(relativePath),
+                      ignore,
+                      keep: (relativePath) =>
+                          index.has(relativePath) ||
+                          trackedDirs.has(relativePath),
+                      readText: (vaultPath) => this.readVaultText(vaultPath),
+                  }
+              );
+        this.plugin.crashLog?.log("computeStatus-worktree", {
+            files: vaultFiles.size,
+            mobile: Platform.isMobileApp,
+        });
 
         const { modified, deleted } = await diffWorktreeAgainstIndex({
             index,
             vaultFiles,
             hashFile: (repoPath) => this.hashVaultFile(repoPath),
         });
-        const untracked = collectUntracked(vaultFiles, index);
-        const staged = await this.diffIndexToHead(index);
+        this.plugin.crashLog?.log("computeStatus-diff", {
+            modified: modified.length,
+            deleted: deleted.length,
+        });
+        const untracked = Platform.isMobileApp
+            ? []
+            : collectUntracked(vaultFiles, index);
+        const staged = Platform.isMobileApp
+            ? []
+            : await this.diffIndexToHead(index);
+        this.plugin.crashLog?.log("computeStatus-done", {
+            untracked: untracked.length,
+            staged: staged.length,
+        });
 
         return composeStatus({
             staged,
@@ -458,6 +484,32 @@ export class WasmGit extends GitManager {
             toVaultPath: (repoPath) => this.getRelativeVaultPath(repoPath),
             pathFilter,
         });
+    }
+
+    /**
+     * Stats only index paths. A full vault walk on iOS can sit for minutes
+     * with no UI update and looks like a hung sync.
+     */
+    private async statTrackedVaultFiles(
+        index: Map<string, GitIndexEntry>
+    ): Promise<Map<string, VaultFileMeta>> {
+        const files = new Map<string, VaultFileMeta>();
+        let n = 0;
+        for (const repoPath of index.keys()) {
+            const vaultPath = this.getRelativeVaultPath(repoPath);
+            if (!(await this.adapter.exists(vaultPath))) continue;
+            const stat = await this.adapter.stat(vaultPath);
+            if (stat?.type !== "file") continue;
+            files.set(repoPath, { size: stat.size, mtimeMs: stat.mtime });
+            n += 1;
+            if (n % 50 === 0) {
+                this.plugin.crashLog?.log("computeStatus-stat", { n });
+                await new Promise<void>((resolve) => {
+                    window.setTimeout(resolve, 0);
+                });
+            }
+        }
+        return files;
     }
 
     private async readIndexEntriesFromVault(): Promise<GitIndexEntry[]> {
