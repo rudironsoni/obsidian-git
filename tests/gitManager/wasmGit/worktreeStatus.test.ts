@@ -3,12 +3,14 @@ import {
     GIT_FILEMODE_BLOB,
     type GitIndexEntry,
 } from "../../../src/gitManager/wasmGit/gitIndex";
+import { GitIgnore } from "../../../src/gitManager/wasmGit/gitIgnore";
 import {
     collapseUntrackedDirectories,
     collectUntracked,
     composeStatus,
     diffWorktreeAgainstIndex,
     hashGitBlob,
+    walkWorktreeMeta,
 } from "../../../src/gitManager/wasmGit/worktreeStatus";
 
 function entry(
@@ -173,5 +175,47 @@ describe("composeStatus", () => {
         ]);
         expect(status.staged.map((file) => file.path)).toEqual(["staged.md"]);
         expect(status.conflicted).toEqual(["conflict.md"]);
+    });
+});
+
+describe("walkWorktreeMeta", () => {
+    it("lists the vault root as empty string, not slash", async () => {
+        const listed: string[] = [];
+        const adapter = {
+            exists: (path: string) => {
+                if (path === "/" || path === ".") return Promise.resolve(false);
+                return Promise.resolve(path === "");
+            },
+            list: (path: string) => {
+                listed.push(path);
+                if (path !== "") {
+                    throw new Error(`unexpected list path ${path}`);
+                }
+                return Promise.resolve({
+                    files: ["Changed.md"],
+                    folders: [] as string[],
+                });
+            },
+            stat: (path: string) =>
+                Promise.resolve(
+                    path === "Changed.md"
+                        ? { type: "file" as const, mtime: 1, size: 4 }
+                        : null
+                ),
+            readBinary: () => Promise.resolve(new ArrayBuffer(0)),
+            writeBinary: () => Promise.resolve(),
+            mkdir: () => Promise.resolve(),
+            remove: () => Promise.resolve(),
+            rmdir: () => Promise.resolve(),
+        };
+        const ignore = new GitIgnore();
+        const files = await walkWorktreeMeta(adapter, "", {
+            exclude: () => false,
+            ignore,
+            keep: () => false,
+            readText: () => Promise.resolve(""),
+        });
+        expect(listed).toEqual([""]);
+        expect([...files.keys()]).toEqual(["Changed.md"]);
     });
 });

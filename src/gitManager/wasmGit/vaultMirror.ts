@@ -281,13 +281,13 @@ export class VaultMirror {
     }> {
         const files = new Map<string, FileMeta>();
         const dirs: string[] = [];
-        if (!(await this.adapter.exists(this.vaultRoot || "/"))) {
+        if (!(await this.adapter.exists(this.vaultRoot))) {
             return { files, dirs };
         }
         const pending: string[] = [this.vaultRoot];
         while (pending.length > 0) {
             const dir = pending.pop()!;
-            const listing = await this.adapter.list(dir || "/");
+            const listing = await this.adapter.list(dir === "/" ? "" : dir);
             for (const folder of listing.folders) {
                 const relativePath = this.toRelative(folder);
                 if (!this.excludeVaultRead(relativePath)) {

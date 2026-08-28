@@ -452,6 +452,7 @@ export class WasmGit extends GitManager {
         ];
 
         const ignore = new GitIgnore();
+        ignore.addFile("", `${this.app.vault.configDir}/\n`);
         const excludePath = normalizePath(
             `${this.getGitDirVaultPath()}/info/exclude`
         );

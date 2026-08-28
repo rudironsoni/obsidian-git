@@ -18,6 +18,14 @@ export interface VaultFileMeta {
  * caller hashes an individual file only when the index size matches but the
  * mtime does not, so peak memory stays at one file plus the `.git` mirror.
  */
+/**
+ * Obsidian's vault adapter uses `""` for the vault root. `"/"` is not a
+ * vault path and can miss every file during status.
+ */
+export function vaultListPath(dir: string): string {
+    return dir === "/" ? "" : dir;
+}
+
 export async function walkWorktreeMeta(
     adapter: MirrorAdapter,
     worktreeRoot: string,
@@ -30,13 +38,14 @@ export async function walkWorktreeMeta(
     }
 ): Promise<Map<string, VaultFileMeta>> {
     const files = new Map<string, VaultFileMeta>();
-    if (!(await adapter.exists(worktreeRoot || "/"))) {
+    const root = vaultListPath(worktreeRoot);
+    if (!(await adapter.exists(root))) {
         return files;
     }
-    const pending: string[] = [worktreeRoot];
+    const pending: string[] = [root];
     while (pending.length > 0) {
         const dir = pending.pop()!;
-        const listing = await adapter.list(dir || "/");
+        const listing = await adapter.list(vaultListPath(dir));
         const relativeDir = toRelative(worktreeRoot, dir || "");
         const gitignore = listing.files.find(
             (file) => toRelative(worktreeRoot, file) === joinIgnore(relativeDir)

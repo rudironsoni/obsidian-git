@@ -39,6 +39,11 @@ describe("obsidian-git smoke", function () {
     it("opens source control and lists a changed file", async function () {
         await waitForGitReady();
 
+        await browser.executeObsidianCommand(OPEN_SOURCE_CONTROL);
+
+        const view = browser.$("main.git-view");
+        await expect(view).toExist();
+
         await browser.executeObsidian(async ({ app }, pluginId) => {
             if (!(await app.vault.adapter.exists("Changed.md"))) {
                 await app.vault.create("Changed.md", "e2e change\n");
@@ -48,18 +53,13 @@ describe("obsidian-git smoke", function () {
                     plugins: {
                         plugins: Record<
                             string,
-                            { refresh?: () => Promise<void> }
+                            { updateCachedStatus?: () => Promise<unknown> }
                         >;
                     };
                 }
             ).plugins.plugins[pluginId];
-            await plugin?.refresh?.();
+            await plugin?.updateCachedStatus?.();
         }, PLUGIN_ID);
-
-        await browser.executeObsidianCommand(OPEN_SOURCE_CONTROL);
-
-        const view = browser.$("main.git-view");
-        await expect(view).toExist();
 
         const changed = browser.$('.git-view [data-path="Changed.md"]');
         await expect(changed).toExist();

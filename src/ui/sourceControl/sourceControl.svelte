@@ -128,6 +128,7 @@
     }
 
     async function refresh(): Promise<void> {
+        await Promise.resolve();
         if (!plugin.gitReady) {
             status = undefined;
             return;
@@ -179,11 +180,16 @@
             unPushedCommits = 0;
             return;
         }
-        try {
-            unPushedCommits = await plugin.gitManager.getUnpushedCommits();
-        } catch {
-            unPushedCommits = 0;
-        }
+        window.setTimeout(() => {
+            void plugin.gitManager
+                .getUnpushedCommits()
+                .then((n) => {
+                    unPushedCommits = n;
+                })
+                .catch(() => {
+                    unPushedCommits = 0;
+                });
+        }, 0);
     }
 
     function triggerRefresh() {
