@@ -116,6 +116,41 @@ describe("VaultMirror.syncIn", () => {
         expect(lg2.fs.analyzePath(`${memRoot}/note.md`).exists).toBe(true);
         expect(lg2.fs.analyzePath(`${memRoot}/.git`).exists).toBe(false);
     });
+
+    it("skips git object payloads on syncIn and pages them via importSubtree", async () => {
+        const dir = createTempDirectory("obsidian-git-mirror-test-");
+        withCleanup({ cleanup: () => cleanupTempDirectory(dir) });
+        const adapter = new FsVaultAdapter(dir);
+        const memRoot = `/mirror-test-${mirrorCounter++}`;
+        const mirror = new VaultMirror(
+            adapter,
+            lg2.fs,
+            "",
+            memRoot,
+            () => false,
+            (relativePath) =>
+                relativePath === "objects" ||
+                relativePath.startsWith("objects/")
+        );
+        mkdirSync(path.join(dir, "objects/pack"), { recursive: true });
+        writeFileSync(path.join(dir, "HEAD"), "ref: refs/heads/main");
+        writeFileSync(path.join(dir, "objects/pack/pack-1.pack"), "PACK");
+
+        await mirror.syncIn();
+
+        expect(lg2.fs.analyzePath(`${memRoot}/HEAD`).exists).toBe(true);
+        expect(
+            lg2.fs.analyzePath(`${memRoot}/objects/pack/pack-1.pack`).exists
+        ).toBe(false);
+
+        await mirror.importSubtree("objects");
+
+        expect(
+            lg2.fs.readFile(`${memRoot}/objects/pack/pack-1.pack`, {
+                encoding: "utf8",
+            })
+        ).toBe("PACK");
+    });
 });
 
 describe("VaultMirror.syncOut", () => {
@@ -176,6 +211,8 @@ describe("VaultMirror.syncOut", () => {
         await mirror.syncIn();
 
         lg2.fs.writeFile(`${memRoot}/note.md`, "v2");
+        const later = Date.now() + 5000;
+        lg2.fs.utime(`${memRoot}/note.md`, later, later);
         await mirror.syncOut();
         expect(await adapter.read("note.md")).toBe("v2");
 

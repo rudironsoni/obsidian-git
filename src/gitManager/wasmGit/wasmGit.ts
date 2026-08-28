@@ -62,6 +62,7 @@ import {
 } from "./parsers";
 import type { MirrorAdapter } from "./vaultMirror";
 import { VaultMirror } from "./vaultMirror";
+import { isGitObjectPayloadPath } from "./gitObjectPayload";
 import {
     collapseUntrackedDirectories,
     collectUntracked,
@@ -101,6 +102,8 @@ export class WasmGit extends GitManager {
     private worktreeMirror: VaultMirror | undefined;
     private gitDirMirror: VaultMirror | undefined;
     private gitDirLoaded = false;
+    /** True after pack/loose objects have been paged into MEMFS. */
+    private gitOdbLoaded = false;
     private readonly noticeLength = 999_999;
     /**
      * Nested Git operations (commitAll → stageAll + commit) increment this
@@ -161,20 +164,23 @@ export class WasmGit extends GitManager {
             this.adapter,
             this.lg2.fs,
             gitDirVaultPath,
-            MEM_GITDIR
+            MEM_GITDIR,
+            () => false,
+            isGitObjectPayloadPath
         );
         this.gitDirLoaded = false;
+        this.gitOdbLoaded = false;
     }
 
     private async ensureReady(): Promise<void> {
-        this.plugin.crashLog.log("ensureReady", {
+        this.plugin.crashLog?.log("ensureReady", {
             lg2: this.lg2.initialized,
             gitDirLoaded: this.gitDirLoaded,
         });
         if (!this.lg2.initialized) {
-            this.plugin.crashLog.log("lg2-init-start");
+            this.plugin.crashLog?.log("lg2-init-start");
             await this.lg2.init();
-            this.plugin.crashLog.log("lg2-init-done");
+            this.plugin.crashLog?.log("lg2-init-done");
             // A WASM trap unloads the module and invalidates any FS handles
             // the mirrors still hold, so they must be rebuilt from scratch.
             this.discardMirrors();
@@ -185,11 +191,40 @@ export class WasmGit extends GitManager {
         if (!this.gitDirLoaded) {
             // The .git directory is loaded once per session and treated as
             // owned by this engine afterwards; only git itself modifies it.
-            this.plugin.crashLog.log("gitDir-syncIn-start");
+            this.plugin.crashLog?.log("gitDir-syncIn-start", {
+                payloads: false,
+            });
             await this.gitDirMirror!.syncIn();
             this.gitDirLoaded = true;
+            this.ensureGitObjectDirs();
             await this.normalizeRepoConfig();
-            this.plugin.crashLog.log("gitDir-syncIn-done");
+            this.plugin.crashLog?.log("gitDir-syncIn-done", {
+                payloads: false,
+            });
+        }
+    }
+
+    /**
+     * Pages pack and loose objects into MEMFS. Status never calls this.
+     * libgit2 commands that read the ODB (log, commit, cat-file, …) do.
+     */
+    private async ensureOdb(): Promise<void> {
+        await this.ensureReady();
+        if (this.gitOdbLoaded) return;
+        this.plugin.crashLog?.log("gitDir-odb-sync-start");
+        await this.gitDirMirror!.importSubtree("objects");
+        this.gitOdbLoaded = true;
+        this.plugin.crashLog?.log("gitDir-odb-sync-done");
+    }
+
+    private ensureGitObjectDirs(): void {
+        const objects = `${MEM_GITDIR}/objects`;
+        const pack = `${objects}/pack`;
+        if (!this.lg2.fs.analyzePath(objects).exists) {
+            this.lg2.fs.mkdir(objects);
+        }
+        if (!this.lg2.fs.analyzePath(pack).exists) {
+            this.lg2.fs.mkdir(pack);
         }
     }
 
@@ -234,6 +269,7 @@ export class WasmGit extends GitManager {
         this.worktreeMirror = undefined;
         this.gitDirMirror = undefined;
         this.gitDirLoaded = false;
+        this.gitOdbLoaded = false;
     }
 
     /**
@@ -251,7 +287,7 @@ export class WasmGit extends GitManager {
         args: string[],
         opts?: { ignoreErrors?: boolean }
     ): Promise<{ stdout: string; stderr: string }> {
-        await this.ensureReady();
+        await this.ensureOdb();
         return this.lg2.run(MEM_ROOT, args, opts);
     }
 
@@ -275,9 +311,10 @@ export class WasmGit extends GitManager {
         }
     ): Promise<{ stdout: string; stderr: string }> {
         if (opts?.worktree === "none") {
-            await this.ensureReady();
+            await this.ensureOdb();
         } else {
             await this.syncIn();
+            await this.ensureOdb();
         }
         try {
             return await this.lg2.run(MEM_ROOT, args, opts);
@@ -841,7 +878,7 @@ export class WasmGit extends GitManager {
 
     async discard(filepath: string): Promise<void> {
         try {
-            await this.ensureReady();
+            await this.ensureOdb();
             await this.lg2.run(MEM_ROOT, ["checkout", "--", filepath]);
             await this.worktreeMirror!.exportFiles([filepath]);
             await this.gitDirMirror!.syncOut();
@@ -867,7 +904,7 @@ export class WasmGit extends GitManager {
                         (dir == undefined || file.path.startsWith(dir))
                 )
                 .map((file) => file.path);
-            await this.ensureReady();
+            await this.ensureOdb();
             for (let i = 0; i < files.length; i += PATH_BATCH_SIZE) {
                 const batch = files.slice(i, i + PATH_BATCH_SIZE);
                 if (batch.length === 0) continue;
@@ -1541,6 +1578,7 @@ export class WasmGit extends GitManager {
                 branch ?? "HEAD",
             ]);
             this.gitDirLoaded = true;
+            this.gitOdbLoaded = true;
             await this.syncOut();
             progressNotice?.hide();
         } catch (error) {
@@ -1787,7 +1825,7 @@ export class WasmGit extends GitManager {
             });
             return extractFileDiff(result.stdout, filePath) ?? "";
         }
-        await this.ensureReady();
+        await this.ensureOdb();
         await this.worktreeMirror!.importFiles([filePath]);
         // Path-limited `diff` is not reliable on lg2; import only this file
         // and extract its hunk from the full diff. Missing tracked files
@@ -2083,6 +2121,7 @@ export class WasmGit extends GitManager {
         const args = splitCommandLine(command);
         if (args.length === 0) return "";
         await this.syncIn();
+        await this.ensureOdb();
         let result;
         try {
             result = await this.lg2.run(MEM_ROOT, args, {
@@ -2395,6 +2434,7 @@ export class WasmGit extends GitManager {
         this.worktreeMirror = undefined;
         this.gitDirMirror = undefined;
         this.gitDirLoaded = false;
+        this.gitOdbLoaded = false;
     }
 
     private reportError(error: unknown): void {

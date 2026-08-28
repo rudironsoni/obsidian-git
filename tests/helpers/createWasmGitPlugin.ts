@@ -62,6 +62,7 @@ export function createWasmGitPlugin(args: {
                 storage.set("conflict", String(value)),
         },
         storage,
+        crashLog: { log: vi.fn() },
         setPluginState: vi.fn(),
         log: vi.fn(),
         displayError: vi.fn(),

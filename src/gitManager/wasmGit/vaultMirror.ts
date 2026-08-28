@@ -49,7 +49,15 @@ export class VaultMirror {
         readonly memRoot: string,
         /** Returns true for relative paths that must not be mirrored. */
         private readonly exclude: (relativePath: string) => boolean = () =>
-            false
+            false,
+        /**
+         * Vault-walk exclude. Defaults to {@link exclude}. The git-dir
+         * mirror uses this to skip `objects/` on `syncIn` while still
+         * writing object payloads back out of MEMFS on `syncOut`.
+         */
+        private readonly excludeVaultRead: (
+            relativePath: string
+        ) => boolean = exclude
     ) {}
 
     private toVaultPath(relativePath: string): string {
@@ -209,6 +217,33 @@ export class VaultMirror {
     }
 
     /**
+     * Copies one vault subdirectory into memory, including paths that
+     * {@link excludeVaultRead} would skip on a full `syncIn`. Does not prune
+     * other mirrored files.
+     */
+    async importSubtree(relativeDir: string): Promise<void> {
+        const vaultDir = this.toVaultPath(relativeDir);
+        if (!(await this.adapter.exists(vaultDir))) {
+            this.ensureMemDir(this.toMemPath(relativeDir));
+            return;
+        }
+        const pending: string[] = [relativeDir];
+        while (pending.length > 0) {
+            const relDir = pending.pop()!;
+            const listing = await this.adapter.list(this.toVaultPath(relDir));
+            this.ensureMemDir(this.toMemPath(relDir));
+            for (const folder of listing.folders) {
+                pending.push(this.toRelative(folder));
+            }
+            const files: string[] = [];
+            for (const file of listing.files) {
+                files.push(this.toRelative(file));
+            }
+            await this.importFiles(files);
+        }
+    }
+
+    /**
      * Writes the given repository-relative files from memory back to the
      * vault. Paths that exist in memory are created/updated; paths that do
      * not are removed from the vault. Nothing outside `relativePaths` is
@@ -255,14 +290,14 @@ export class VaultMirror {
             const listing = await this.adapter.list(dir || "/");
             for (const folder of listing.folders) {
                 const relativePath = this.toRelative(folder);
-                if (!this.exclude(relativePath)) {
+                if (!this.excludeVaultRead(relativePath)) {
                     dirs.push(relativePath);
                     pending.push(folder);
                 }
             }
             for (const file of listing.files) {
                 const relativePath = this.toRelative(file);
-                if (this.exclude(relativePath)) continue;
+                if (this.excludeVaultRead(relativePath)) continue;
                 const stat = await this.adapter.stat(file);
                 if (stat?.type !== "file") continue;
                 files.set(relativePath, {
