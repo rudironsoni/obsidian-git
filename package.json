@@ -16,6 +16,7 @@
         "test:watch": "vitest",
         "test:coverage": "vitest run --coverage",
         "test:e2e": "pnpm run build && wdio run ./wdio.conf.mts",
+        "sync:test-vault": "bash scripts/sync-test-vault-plugin.sh",
         "wdio:mcp": "npx -y @wdio/mcp",
         "all": "pnpm run tsc && pnpm run svelte && pnpm run format && pnpm run lint && pnpm run test",
         "rulesync:install": "rulesync install",

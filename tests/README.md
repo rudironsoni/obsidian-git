@@ -148,7 +148,9 @@ pnpm run test:e2e
 
 -   Config: `wdio.conf.mts`
 -   Specs: `e2e/specs/*.e2e.ts`
--   Vault fixture: `e2e/vaults/simple` (git-initialized in `onPrepare`)
+-   Vault fixture: `tests/test-vault` (git-initialized in `onPrepare`)
+-   After `pnpm run dev` or `pnpm run build`, run `pnpm run sync:test-vault` so
+    iOS gets real plugin files (not a symlink)
 -   Linux CI: xvfb job in `.github/workflows/test.yml`
 -   Cursor Cloud: skip E2E (no display)
 

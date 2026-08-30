@@ -3,9 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const e2eDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-export const E2E_VAULT_DIR = path.join(e2eDir, "vaults", "simple");
+export const E2E_VAULT_DIR = path.join(repoRoot, "tests", "test-vault");
 
 export function ensureE2eVaultGitRepo(vaultPath = E2E_VAULT_DIR): void {
     fs.mkdirSync(vaultPath, { recursive: true });

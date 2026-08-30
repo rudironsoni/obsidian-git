@@ -17,6 +17,7 @@ export default defineConfig(
             "scripts/**/*.sh",
             ".obsidian-cache/",
             "e2e/vaults/",
+            "tests/test-vault/",
         ],
     },
     eslint.configs.recommended,
