@@ -121,43 +121,63 @@ export class WasmGitHttpBridge {
     private async performRequest(
         connection: HttpConnection
     ): Promise<Uint8Array> {
-        const headers: Record<string, string> = {
-            // Ask the server not to compress the response. The packfile
-            // parser needs the exact raw bytes; if a server or proxy gzips
-            // the response and the platform does not transparently inflate
-            // it, the packfile is persisted corrupted.
-            "Accept-Encoding": "identity",
-            ...connection.headers,
-        };
-        const authHeader = this.getAuthHeader();
-        if (authHeader) {
-            headers["Authorization"] = authHeader;
-        }
         let body: ArrayBuffer | undefined;
         if (connection.requestChunks.length > 0) {
             body = concatChunks(connection.requestChunks);
         }
-
-        let response;
-        try {
-            response = await requestUrl({
+        return sendGitHttpRequest(
+            {
                 url: connection.url,
                 method: connection.method,
-                headers,
+                headers: connection.headers,
                 body,
-                throw: false,
-            });
-        } catch (error) {
-            throw new NoNetworkError(
-                error instanceof Error ? error.message : String(error)
-            );
-        }
-        if (response.status >= 400) {
-            throw new HttpStatusError(response.status, connection.url);
-        }
-        const inflated = await inflateIfGzipped(response.arrayBuffer);
-        return new Uint8Array(inflated);
+            },
+            this.getAuthHeader
+        );
     }
+}
+
+export async function sendGitHttpRequest(
+    request: {
+        url: string;
+        method: string;
+        headers: Record<string, string>;
+        body?: ArrayBuffer;
+    },
+    getAuthHeader: () => string | undefined
+): Promise<Uint8Array> {
+    const headers: Record<string, string> = {
+        // Ask the server not to compress the response. The packfile
+        // parser needs the exact raw bytes; if a server or proxy gzips
+        // the response and the platform does not transparently inflate
+        // it, the packfile is persisted corrupted.
+        "Accept-Encoding": "identity",
+        ...request.headers,
+    };
+    const authHeader = getAuthHeader();
+    if (authHeader) {
+        headers["Authorization"] = authHeader;
+    }
+
+    let response;
+    try {
+        response = await requestUrl({
+            url: request.url,
+            method: request.method,
+            headers,
+            body: request.body,
+            throw: false,
+        });
+    } catch (error) {
+        throw new NoNetworkError(
+            error instanceof Error ? error.message : String(error)
+        );
+    }
+    if (response.status >= 400) {
+        throw new HttpStatusError(response.status, request.url);
+    }
+    const inflated = await inflateIfGzipped(response.arrayBuffer);
+    return new Uint8Array(inflated);
 }
 
 function concatChunks(chunks: Uint8Array[]): ArrayBuffer {

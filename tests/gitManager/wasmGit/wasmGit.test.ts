@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Platform } from "obsidian";
 import { WasmGit } from "../../../src/gitManager/wasmGit/wasmGit";
 import { Lg2Error } from "../../../src/gitManager/wasmGit/lg2";
@@ -53,6 +53,14 @@ type VaultFixture = {
     plugin: WasmGitFakePlugin;
     manager: WasmGit;
 };
+
+beforeEach(() => {
+    Platform.isDesktop = true;
+    Platform.isDesktopApp = true;
+    Platform.isMobile = false;
+    Platform.isMobileApp = false;
+    Platform.isIosApp = false;
+});
 
 function createVault(args?: {
     settings?: Partial<ObsidianGitSettings>;
@@ -464,6 +472,43 @@ describe("WasmGit.commit", () => {
         );
         expect(events).toContain("commit-vault-done");
         expect(events).not.toContain("lg2-init-start");
+        expect(events).not.toContain("gitDir-syncIn-start");
+    });
+
+    it("commits on mobile with a GitHub remote without wasm", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        await git(vault.dir, [
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ]);
+        await git(vault.dir, ["config", "branch.main.remote", "origin"]);
+        await git(vault.dir, [
+            "config",
+            "branch.main.merge",
+            "refs/heads/main",
+        ]);
+        writeFileSync(path.join(vault.dir, "note.md"), "changed\n");
+        Platform.isMobileApp = true;
+        try {
+            const changed = await vault.manager.commitAll({
+                message: "with remote",
+            });
+            expect(changed).toBe(1);
+        } finally {
+            Platform.isMobileApp = false;
+        }
+        expect(
+            (await git(vault.dir, ["log", "-1", "--pretty=%s"])).trim()
+        ).toBe("with remote");
+        const events = vault.plugin.crashLog.log.mock.calls.map((call) =>
+            String(call[0])
+        );
+        expect(events).toContain("commit-vault-done");
+        expect(events).not.toContain("lg2-init-start");
+        expect(events).not.toContain("gitDir-syncIn-start");
     });
 
     it("commits staged changes only", async () => {
@@ -517,6 +562,9 @@ describe("WasmGit.commit", () => {
         await seedRepo(vault);
         writeFileSync(path.join(vault.dir, "second.md"), "second\n");
         await vault.manager.commitAll({ message: "second" });
+        expect(
+            (await git(vault.dir, ["log", "-1", "--pretty=%s"])).trim()
+        ).toBe("second");
         writeFileSync(path.join(vault.dir, "second.md"), "second amended\n");
         await vault.manager.stage("second.md", true);
 
@@ -755,31 +803,59 @@ describe("WasmGit gitdir-only reads", () => {
         expect(events).not.toContain("ensureReady");
     });
 
-    it("does not start wasm for unpushed or last-commit reads on mobile", async () => {
+    it("reads branch, remotes, last commit, and unpushed on mobile without wasm", async () => {
         const vault = createVault();
         await seedRepo(vault);
+        const remoteDir = createTempDirectory("obsidian-git-wasm-remote-");
+        withCleanup({ cleanup: () => cleanupTempDirectory(remoteDir) });
+        await git(remoteDir, ["init", "--bare", "--initial-branch=main", "."]);
+        await git(vault.dir, ["remote", "add", "origin", remoteDir]);
+        await git(vault.dir, ["push", "--quiet", "-u", "origin", "main"]);
+        await git(vault.dir, [
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/repo.git",
+        ]);
+        writeFileSync(path.join(vault.dir, "unpushed.md"), "unpushed\n");
+        await git(vault.dir, ["add", "unpushed.md"]);
+        await git(vault.dir, ["commit", "-m", "unpushed"]);
+
         Platform.isMobileApp = true;
         try {
-            expect(await vault.manager.getUnpushedCommits()).toBe(0);
-            expect(await vault.manager.getLastCommitTime()).toBeUndefined();
+            const info = await vault.manager.branchInfo();
+            expect(info.current).toBe("main");
+            expect(info.tracking).toBe("origin/main");
+            expect(info.remote).toBe("origin");
+            expect(await vault.manager.getRemotes()).toEqual(["origin"]);
+            expect(await vault.manager.getRemoteUrl("origin")).toBe(
+                "https://github.com/example/repo.git"
+            );
+            expect(await vault.manager.getLastCommitTime()).toBeInstanceOf(
+                Date
+            );
+            expect(await vault.manager.getUnpushedCommits()).toBe(1);
+            expect(await vault.manager.canPush()).toBe(true);
+            expect(await vault.manager.lsFiles()).toEqual([
+                "note.md",
+                "unpushed.md",
+            ]);
         } finally {
             Platform.isMobileApp = false;
         }
         const events = vault.plugin.crashLog.log.mock.calls.map((call) =>
             String(call[0])
         );
-        expect(events).toContain("skip-wasm-read");
+        expect(events).not.toContain("skip-wasm-read");
         expect(events).not.toContain("lg2-init-start");
         expect(events).not.toContain("ensureReady");
+        expect(events).not.toContain("gitDir-syncIn-start");
     });
 
     it("shares one lg2 init when ensureReady races", async () => {
         const vault = createVault();
         await seedRepo(vault);
-        await Promise.all([
-            vault.manager.branchInfo(),
-            vault.manager.branchInfo(),
-        ]);
+        await Promise.all([vault.manager.log(), vault.manager.log()]);
         const inits = vault.plugin.crashLog.log.mock.calls.filter(
             (call) => String(call[0]) === "lg2-init-start"
         );

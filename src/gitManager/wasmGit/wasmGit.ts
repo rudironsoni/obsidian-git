@@ -38,7 +38,6 @@ import {
     parseGitIndex,
     removeIndexPath,
     upsertStagedFile,
-    writeGitIndex,
     type GitIndexEntry,
 } from "./gitIndex";
 import {
@@ -68,14 +67,19 @@ import {
 import type { MirrorAdapter } from "./vaultMirror";
 import { VaultMirror } from "./vaultMirror";
 import { isGitDirSkippedOnSyncIn } from "./gitObjectPayload";
+import { GitCpu } from "./gitCpu";
 import {
     countIndexDiff,
-    gitObjectStore,
+    countUnpushedFromReflog,
     gitTimezoneOffset,
+    listGitConfigSubsections,
     looseObjectVaultPath,
     parseGitConfigValue,
+    parsePackedRefs,
+    parseReflogUnixSeconds,
+    removeGitConfigSection,
     serializeGitCommit,
-    writeTreeFromIndex,
+    upsertGitConfigValue,
     type GitSignature,
 } from "./gitWrite";
 import {
@@ -83,7 +87,6 @@ import {
     collectUntracked,
     composeStatus,
     diffWorktreeAgainstIndex,
-    hashGitBlob,
     walkWorktreeMeta,
     type VaultFileMeta,
 } from "./worktreeStatus";
@@ -114,7 +117,8 @@ const BLOB_WRITE_CONCURRENCY = 8;
  */
 export class WasmGit extends GitManager {
     private readonly httpBridge = new WasmGitHttpBridge();
-    private readonly lg2 = new Lg2(this.httpBridge);
+    private readonly cpu = new GitCpu();
+    private readonly lg2 = new Lg2(this.httpBridge, this.cpu);
     private worktreeMirror: VaultMirror | undefined;
     private gitDirMirror: VaultMirror | undefined;
     private gitDirLoaded = false;
@@ -141,6 +145,7 @@ export class WasmGit extends GitManager {
             if (!username || !password) return undefined;
             return "Basic " + btoa(`${username}:${password}`);
         };
+        this.cpu.getAuthHeader = () => this.httpBridge.getAuthHeader();
     }
 
     // ------------------------------------------------------------------
@@ -237,19 +242,6 @@ export class WasmGit extends GitManager {
                 payloads: false,
             });
         }
-    }
-
-    /**
-     * Status, Source Control, and the status bar must not start wasm on
-     * iOS. `getUnpushedCommits` / `getLastCommitTime` used to call
-     * `ensureReady` after `computeStatus-done` and copy `.git` metadata
-     * into MEMFS, which jetsams the WebView. Commit, pull, and push still
-     * use wasm.
-     */
-    private skipMobileWasmRead(op: string): boolean {
-        if (!Platform.isMobileApp) return false;
-        this.plugin.crashLog?.log("skip-wasm-read", { op });
-        return true;
     }
 
     /**
@@ -633,17 +625,103 @@ export class WasmGit extends GitManager {
                 ? value.toLowerCase()
                 : undefined;
         }
+        const packed = await this.readPackedRefsFromVault();
+        return packed.get(ref);
+    }
+
+    private async readPackedRefsFromVault(): Promise<Map<string, string>> {
         const packedPath = normalizePath(
             `${this.getGitDirVaultPath()}/packed-refs`
         );
-        if (!(await this.adapter.exists(packedPath))) return undefined;
-        const packed = await this.readVaultText(packedPath);
-        for (const line of packed.split("\n")) {
-            if (line.startsWith("#") || line.startsWith("^")) continue;
-            const match = line.match(/^([0-9a-f]{40})\s+(\S+)$/i);
-            if (match?.[2] === ref) return match[1]!.toLowerCase();
+        if (!(await this.adapter.exists(packedPath))) return new Map();
+        return parsePackedRefs(await this.readVaultText(packedPath));
+    }
+
+    private async resolveVaultRef(rev: string): Promise<string | undefined> {
+        const trimmed = rev.trim();
+        if (/^[0-9a-f]{40}$/i.test(trimmed)) return trimmed.toLowerCase();
+        if (trimmed === "HEAD") return this.resolveHeadCommitHash();
+        const candidates = [
+            trimmed,
+            `refs/heads/${trimmed}`,
+            `refs/remotes/${trimmed}`,
+            `refs/tags/${trimmed}`,
+            `refs/${trimmed}`,
+        ];
+        const packed = await this.readPackedRefsFromVault();
+        for (const name of candidates) {
+            const refPath = normalizePath(
+                `${this.getGitDirVaultPath()}/${name}`
+            );
+            if (await this.adapter.exists(refPath)) {
+                const value = (await this.readVaultText(refPath)).trim();
+                if (/^[0-9a-f]{40}$/i.test(value)) return value.toLowerCase();
+                if (value.startsWith("ref: ")) {
+                    return this.resolveVaultRef(value.substring(5).trim());
+                }
+            }
+            const packedHash = packed.get(name);
+            if (packedHash) return packedHash;
         }
         return undefined;
+    }
+
+    private async listLooseRefs(prefix: string): Promise<Map<string, string>> {
+        const refs = new Map<string, string>();
+        const root = normalizePath(`${this.getGitDirVaultPath()}/${prefix}`);
+        if (!(await this.adapter.exists(root))) return refs;
+        const pending = [root];
+        while (pending.length > 0) {
+            const dir = pending.pop()!;
+            const listing = await this.adapter.list(dir);
+            for (const folder of listing.folders) pending.push(folder);
+            for (const file of listing.files) {
+                const value = (await this.readVaultText(file)).trim();
+                if (!/^[0-9a-f]{40}$/i.test(value)) continue;
+                const relative = file.startsWith(`${root}/`)
+                    ? file.substring(root.length + 1)
+                    : file;
+                refs.set(relative, value.toLowerCase());
+            }
+        }
+        return refs;
+    }
+
+    private async countUnpushedLooseCommits(
+        head: string,
+        tracking: string
+    ): Promise<number | undefined> {
+        let current: string | undefined = head;
+        let count = 0;
+        const seen = new Set<string>();
+        while (current && current !== tracking) {
+            if (seen.has(current)) return undefined;
+            seen.add(current);
+            const object = await this.readLooseObject(current);
+            if (object == undefined || object.type !== "commit") {
+                return undefined;
+            }
+            count += 1;
+            const parsed = parseCommitObject(
+                new TextDecoder("utf-8").decode(object.payload)
+            );
+            current = parsed?.parents[0];
+        }
+        return current === tracking ? count : undefined;
+    }
+
+    private async countUnpushedFromBranchLog(
+        branch: string,
+        tracking: string
+    ): Promise<number | undefined> {
+        const logPath = normalizePath(
+            `${this.getGitDirVaultPath()}/logs/refs/heads/${branch}`
+        );
+        if (!(await this.adapter.exists(logPath))) return undefined;
+        return countUnpushedFromReflog(
+            await this.readVaultText(logPath),
+            tracking
+        );
     }
 
     private async walkLooseTree(
@@ -694,7 +772,7 @@ export class WasmGit extends GitManager {
         const data = new Uint8Array(
             await this.adapter.readBinary(this.getRelativeVaultPath(repoPath))
         );
-        return hashGitBlob(data);
+        return this.cpu.hashGitBlob(data);
     }
 
     async getStagedFiles(
@@ -732,7 +810,6 @@ export class WasmGit extends GitManager {
         // contain untracked files are collapsed to `dir/`, matching native
         // git and allowing efficient recursive deletion.
         const status = opts?.status ?? (await this.computeStatus(opts?.path));
-        await this.ensureReady();
         const untracked = status.changed
             .filter((file) => file.workingDir === "U" && file.index === "U")
             .map((file) => file.path)
@@ -740,7 +817,7 @@ export class WasmGit extends GitManager {
                 (path) =>
                     opts?.path == undefined || path.startsWith(`${opts.path}/`)
             );
-        const tracked = this.readIndexEntries()
+        const tracked = (await this.readIndexEntriesFromVault())
             .filter((entry) => entry.stage === 0)
             .map((entry) => entry.path);
         return collapseUntrackedDirectories(untracked, tracked);
@@ -914,7 +991,7 @@ export class WasmGit extends GitManager {
      * pointing at blobs that were never flushed.
      */
     private async persistIndex(entries: GitIndexEntry[]): Promise<void> {
-        const data = await writeGitIndex(entries);
+        const data = await this.cpu.writeGitIndex(entries);
         if (this.useVaultGit()) {
             await this.writeIndexToVault(data);
             return;
@@ -1171,6 +1248,7 @@ export class WasmGit extends GitManager {
     async commitAll({
         message,
         amend,
+        status,
     }: {
         message: string;
         status?: Status;
@@ -1180,7 +1258,7 @@ export class WasmGit extends GitManager {
         this.silenceErrors += 1;
         try {
             await this.checkAuthorInfo();
-            await this.stageAll({});
+            await this.stageAll({ status });
             return await this.commit({ message, amend });
         } finally {
             this.silenceErrors -= 1;
@@ -1235,13 +1313,19 @@ export class WasmGit extends GitManager {
                     "Amending the initial commit is not supported with the wasm-git engine."
                 );
             }
-            await this.mutate(["reset", "--soft", "HEAD~1"], {
-                worktree: "none",
-            });
         }
-        await this.mutate(["commit", "-m", formattedMessage], {
-            worktree: "none",
-        });
+        await this.ensureOdb();
+        try {
+            if (amend) {
+                await this.lg2.run(MEM_ROOT, ["reset", "--soft", "HEAD~1"]);
+            }
+            await this.lg2.run(MEM_ROOT, ["commit", "-m", formattedMessage]);
+        } catch (error) {
+            this.gitDirLoaded = false;
+            this.gitOdbLoaded = false;
+            throw error;
+        }
+        await this.gitDirMirror!.syncOut();
         this.plugin.localStorage.setConflict(false);
         return status.staged.length;
     }
@@ -1266,9 +1350,13 @@ export class WasmGit extends GitManager {
         const parent = await this.resolveHeadCommitHash();
         const headBlobs = await this.readHeadBlobMap();
         const changed = countIndexDiff(index, headBlobs);
-        const tree = await writeTreeFromIndex(entries, (type, payload) =>
-            this.writeLooseObject(type, payload)
-        );
+        const { tree, objects } = await this.cpu.writeTreeFromIndex(entries);
+        for (const object of objects) {
+            await this.writeCompressedLooseObject(
+                object.hash,
+                object.compressed
+            );
+        }
         this.plugin.crashLog?.log("commit-vault-tree", { tree, changed });
         if (parent != undefined && changed === 0) {
             const parentCommit = await this.readLooseObject(parent);
@@ -1317,18 +1405,24 @@ export class WasmGit extends GitManager {
         type: string,
         payload: Uint8Array
     ): Promise<string> {
-        const { hash, compressed } = await gitObjectStore(type, payload);
+        const { hash, compressed } = await this.cpu.gitObjectStore(
+            type,
+            payload
+        );
+        await this.writeCompressedLooseObject(hash, compressed);
+        return hash;
+    }
+
+    private async writeCompressedLooseObject(
+        hash: string,
+        compressed: Uint8Array
+    ): Promise<void> {
         const vaultPath = normalizePath(
             looseObjectVaultPath(this.getGitDirVaultPath(), hash)
         );
-        if (!(await this.adapter.exists(vaultPath))) {
-            await this.ensureVaultDir(parentOfVault(vaultPath));
-            await this.adapter.writeBinary(
-                vaultPath,
-                toArrayBuffer(compressed)
-            );
-        }
-        return hash;
+        if (await this.adapter.exists(vaultPath)) return;
+        await this.ensureVaultDir(parentOfVault(vaultPath));
+        await this.adapter.writeBinary(vaultPath, toArrayBuffer(compressed));
     }
 
     private async ensureVaultDir(path: string): Promise<void> {
@@ -1724,29 +1818,32 @@ export class WasmGit extends GitManager {
     }
 
     async getUnpushedCommits(): Promise<number> {
-        if (this.skipMobileWasmRead("getUnpushedCommits")) {
-            return 0;
-        }
-        const branchInfo = await this.branchInfo();
+        const branchInfo = await this.branchInfoFromVault();
         if (!branchInfo.current || !branchInfo.tracking) {
             return 0;
         }
-        const result = await this.readGitDir(
-            ["rev-list", `${branchInfo.tracking}..HEAD`],
-            { ignoreErrors: true }
+        const head = await this.resolveVaultRef("HEAD");
+        const tracking = await this.resolveVaultRef(branchInfo.tracking);
+        if (!head) return 0;
+        if (!tracking) return 1;
+        if (head === tracking) return 0;
+        const walked = await this.countUnpushedLooseCommits(head, tracking);
+        if (walked != undefined) return walked;
+        const fromLog = await this.countUnpushedFromBranchLog(
+            branchInfo.current,
+            tracking
         );
-        return result.stdout
-            .split("\n")
-            .filter((line) => /^[0-9a-f]{40}$/.test(line)).length;
+        if (fromLog != undefined) return fromLog;
+        return 1;
     }
 
     async canPush(): Promise<boolean> {
-        const branchInfo = await this.branchInfo();
+        const branchInfo = await this.branchInfoFromVault();
         if (!branchInfo.current) return false;
-        const current = await this.revParse(branchInfo.current);
+        const current = await this.resolveVaultRef(branchInfo.current);
         if (!current) return false;
         if (!branchInfo.tracking) return true;
-        const tracking = await this.revParse(branchInfo.tracking);
+        const tracking = await this.resolveVaultRef(branchInfo.tracking);
         if (!tracking) return true;
         return current !== tracking;
     }
@@ -1764,43 +1861,41 @@ export class WasmGit extends GitManager {
 
     async branchInfo(): Promise<BranchInfo & { remote: string }> {
         try {
-            await this.ensureReady();
-            let current: string | undefined;
-            const headPath = `${MEM_GITDIR}/HEAD`;
-            if (this.lg2.fs.analyzePath(headPath).exists) {
-                const head = this.lg2.fs
-                    .readFile(headPath, { encoding: "utf8" })
-                    .trim();
-                const symref = head.match(/^ref: refs\/heads\/(.*)$/);
-                current = symref ? symref[1] : undefined;
-            }
-
-            const refs = await this.readGitDir(["for-each-ref"], {
-                ignoreErrors: true,
-            });
-            const branches = parseForEachRef(refs.stdout)
-                .filter((ref) => ref.refName.startsWith("refs/heads/"))
-                .map((ref) => ref.refName.substring("refs/heads/".length));
-
-            let tracking: string | undefined;
-            let remote = "origin";
-            if (current) {
-                remote =
-                    (await this.getConfig(`branch.${current}.remote`)) ??
-                    "origin";
-                const mergeRef = await this.getConfig(
-                    `branch.${current}.merge`
-                );
-                const trackingBranch = mergeRef?.split("refs/heads/")[1];
-                tracking = trackingBranch
-                    ? `${remote}/${trackingBranch}`
-                    : undefined;
-            }
-            return { current, tracking, branches, remote };
+            return await this.branchInfoFromVault();
         } catch (error) {
             this.reportError(error);
             throw error;
         }
+    }
+
+    /**
+     * Branch name, remotes, and tracking from `.git` text files. Does not
+     * start wasm. Commit used to call this via `hasTooBigFiles` and then
+     * `gitDir-syncIn` jetsamed iOS.
+     */
+    private async branchInfoFromVault(): Promise<
+        BranchInfo & { remote: string }
+    > {
+        const current = await this.readCurrentBranchFromVault();
+        const packed = await this.readPackedRefsFromVault();
+        const looseHeads = await this.listLooseRefs("refs/heads");
+        const branches = [
+            ...new Set([...looseHeads.keys(), ...packedHeadNames(packed)]),
+        ].sort();
+        let tracking: string | undefined;
+        let remote = "origin";
+        if (current) {
+            remote =
+                (await this.getConfig(`branch.${current}.remote`)) ?? "origin";
+            const mergeRef = await this.getConfig(`branch.${current}.merge`);
+            const trackingBranch = mergeRef?.startsWith("refs/heads/")
+                ? mergeRef.substring("refs/heads/".length)
+                : mergeRef;
+            tracking = trackingBranch
+                ? `${remote}/${trackingBranch}`
+                : undefined;
+        }
+        return { current, tracking, branches, remote };
     }
 
     async getCurrentRemote(): Promise<string> {
@@ -2019,16 +2114,21 @@ export class WasmGit extends GitManager {
 
     async setRemote(name: string, url: string): Promise<void> {
         try {
-            const remotes = await this.getRemotes();
-            if (remotes.includes(name)) {
-                await this.mutate(["remote", "set-url", name, url], {
-                    worktree: "none",
-                });
-            } else {
-                await this.mutate(["remote", "add", name, url], {
-                    worktree: "none",
-                });
-            }
+            await this.writeVaultGitConfig((content) => {
+                let next = upsertGitConfigValue(
+                    content,
+                    `remote.${name}.url`,
+                    url
+                );
+                if (!parseGitConfigValue(next, `remote.${name}.fetch`)) {
+                    next = upsertGitConfigValue(
+                        next,
+                        `remote.${name}.fetch`,
+                        `+refs/heads/*:refs/remotes/${name}/*`
+                    );
+                }
+                return next;
+            });
         } catch (error) {
             this.reportError(error);
             throw error;
@@ -2036,23 +2136,37 @@ export class WasmGit extends GitManager {
     }
 
     async getRemotes(): Promise<string[]> {
-        const result = await this.readGitDir(["remote", "show"], {
-            ignoreErrors: true,
-        });
-        return result.stdout.split("\n").filter((line) => line.length > 0);
+        const configPath = normalizePath(`${this.getGitDirVaultPath()}/config`);
+        if (!(await this.adapter.exists(configPath))) return [];
+        return listGitConfigSubsections(
+            await this.readVaultText(configPath),
+            "remote"
+        );
     }
 
     async getRemoteUrl(remote: string): Promise<string | undefined> {
-        const result = await this.readGitDir(["remote", "show", "-v"], {
-            ignoreErrors: true,
-        });
-        return parseRemoteVerbose(result.stdout).get(remote);
+        return this.getConfig(`remote.${remote}.url`);
     }
 
     async removeRemote(remoteName: string): Promise<void> {
-        await this.mutate(["remote", "remove", remoteName], {
-            worktree: "none",
-        });
+        await this.writeVaultGitConfig((content) =>
+            removeGitConfigSection(content, "remote", remoteName)
+        );
+    }
+
+    private async writeVaultGitConfig(
+        mutate: (content: string) => string
+    ): Promise<void> {
+        const configPath = normalizePath(`${this.getGitDirVaultPath()}/config`);
+        const current = (await this.adapter.exists(configPath))
+            ? await this.readVaultText(configPath)
+            : "";
+        const next = mutate(current);
+        await this.adapter.writeBinary(
+            configPath,
+            toArrayBuffer(new TextEncoder().encode(next))
+        );
+        this.gitDirLoaded = false;
     }
 
     async getRemoteBranches(remote: string): Promise<string[]> {
@@ -2219,14 +2333,27 @@ export class WasmGit extends GitManager {
     }
 
     async getLastCommitTime(): Promise<Date | undefined> {
-        if (this.skipMobileWasmRead("getLastCommitTime")) {
-            return undefined;
-        }
-        const head = await this.revParse("HEAD");
+        const head = await this.resolveHeadCommitHash();
         if (!head) return undefined;
-        const commit = await this.catFileCommit(head);
-        if (!commit) return undefined;
-        return new Date(commit.committer.epochSeconds * 1000);
+        const object = await this.readLooseObject(head);
+        if (object?.type === "commit") {
+            const parsed = parseCommitObject(
+                new TextDecoder("utf-8").decode(object.payload)
+            );
+            if (parsed) {
+                return new Date(parsed.committer.epochSeconds * 1000);
+            }
+        }
+        const logPath = normalizePath(`${this.getGitDirVaultPath()}/logs/HEAD`);
+        if (!(await this.adapter.exists(logPath))) return undefined;
+        const lines = (await this.readVaultText(logPath))
+            .split("\n")
+            .filter((line) => line.length > 0);
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const epoch = parseReflogUnixSeconds(lines[i]!);
+            if (epoch != undefined) return new Date(epoch * 1000);
+        }
+        return undefined;
     }
 
     async revParse(rev: string): Promise<string | undefined> {
@@ -2492,10 +2619,12 @@ export class WasmGit extends GitManager {
 
     /** All paths currently tracked in the index. */
     async lsFiles(): Promise<string[]> {
-        const result = await this.readGitDir(["ls-files"], {
-            ignoreErrors: true,
-        });
-        return result.stdout.split("\n").filter((line) => line.length > 0);
+        const entries = await this.readIndexEntriesFromVault();
+        return [
+            ...new Set(
+                entries.filter((entry) => entry.stage === 0).map((e) => e.path)
+            ),
+        ];
     }
 
     /**
@@ -2836,6 +2965,7 @@ export class WasmGit extends GitManager {
 
     unload(): void {
         this.lg2.unload();
+        this.cpu.terminate();
         this.worktreeMirror = undefined;
         this.gitDirMirror = undefined;
         this.gitDirLoaded = false;
@@ -2857,6 +2987,16 @@ export class WasmGit extends GitManager {
         }
         return undefined;
     }
+}
+
+function packedHeadNames(packed: Map<string, string>): string[] {
+    const names: string[] = [];
+    for (const ref of packed.keys()) {
+        if (ref.startsWith("refs/heads/")) {
+            names.push(ref.substring("refs/heads/".length));
+        }
+    }
+    return names;
 }
 
 type StageOp =

@@ -9,11 +9,18 @@ import {
 } from "../../../src/gitManager/wasmGit/gitObject";
 import {
     compareGitTreeEntries,
+    countUnpushedFromReflog,
     gitObjectStore,
+    listGitConfigSubsections,
     parseGitConfigValue,
+    parsePackedRefs,
+    parseReflogUnixSeconds,
+    removeGitConfigSection,
+    upsertGitConfigValue,
     serializeGitCommit,
     serializeGitTree,
     writeTreeFromIndex,
+    writeTreeObjects,
 } from "../../../src/gitManager/wasmGit/gitWrite";
 
 function blob(path: string, hash: string): GitIndexEntry {
@@ -84,6 +91,18 @@ describe("writeTreeFromIndex", () => {
         const names = parseGitTree(root.payload).map((entry) => entry.name);
         expect(names.sort()).toEqual(["b.md", "dir"]);
     });
+
+    it("returns compressed tree objects", async () => {
+        const built = await writeTreeObjects([
+            blob("dir/a.md", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            blob("b.md", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ]);
+        expect(built.tree).toMatch(/^[0-9a-f]{40}$/);
+        expect(built.objects.length).toBeGreaterThan(0);
+        expect(built.objects.some((object) => object.hash === built.tree)).toBe(
+            true
+        );
+    });
 });
 
 describe("serializeGitCommit", () => {
@@ -120,5 +139,89 @@ describe("parseGitConfigValue", () => {
         expect(parseGitConfigValue(content, "user.name")).toBe("Test User");
         expect(parseGitConfigValue(content, "user.email")).toBe("a@b.c");
         expect(parseGitConfigValue(content, "core.filemode")).toBeUndefined();
+    });
+
+    it("reads a subsection key", () => {
+        const content = [
+            '[branch "main"]',
+            "\tremote = origin",
+            "\tmerge = refs/heads/main",
+            '[remote "origin"]',
+            "\turl = https://github.com/example/repo.git",
+            "",
+        ].join("\n");
+        expect(parseGitConfigValue(content, "branch.main.remote")).toBe(
+            "origin"
+        );
+        expect(parseGitConfigValue(content, "branch.main.merge")).toBe(
+            "refs/heads/main"
+        );
+        expect(parseGitConfigValue(content, "remote.origin.url")).toBe(
+            "https://github.com/example/repo.git"
+        );
+        expect(listGitConfigSubsections(content, "remote")).toEqual(["origin"]);
+    });
+
+    it("upserts and removes a remote section", () => {
+        let content = "[user]\n\tname = Test User\n";
+        content = upsertGitConfigValue(
+            content,
+            "remote.origin.url",
+            "https://example.com/a.git"
+        );
+        expect(parseGitConfigValue(content, "remote.origin.url")).toBe(
+            "https://example.com/a.git"
+        );
+        content = upsertGitConfigValue(
+            content,
+            "remote.origin.url",
+            "https://example.com/b.git"
+        );
+        expect(parseGitConfigValue(content, "remote.origin.url")).toBe(
+            "https://example.com/b.git"
+        );
+        content = removeGitConfigSection(content, "remote", "origin");
+        expect(
+            parseGitConfigValue(content, "remote.origin.url")
+        ).toBeUndefined();
+        expect(parseGitConfigValue(content, "user.name")).toBe("Test User");
+    });
+});
+
+describe("parsePackedRefs", () => {
+    it("skips comments and peeled tags", () => {
+        const content = [
+            "# pack-refs with: peeled",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/remotes/origin/main",
+            "^cccccccccccccccccccccccccccccccccccccccc",
+            "",
+        ].join("\n");
+        const refs = parsePackedRefs(content);
+        expect(refs.get("refs/heads/main")).toBe(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        expect(refs.get("refs/remotes/origin/main")).toBe(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        expect(refs.size).toBe(2);
+    });
+});
+
+describe("reflog helpers", () => {
+    it("reads the timestamp and unpushed count", () => {
+        const tracking = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const first = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const second = "cccccccccccccccccccccccccccccccccccccccc";
+        const content = [
+            `${tracking} ${first} Test <t@e.c> 1700000000 +0000\tcommit: one`,
+            `${first} ${second} Test <t@e.c> 1700000001 +0000\tcommit: two`,
+            "",
+        ].join("\n");
+        expect(parseReflogUnixSeconds(content.split("\n")[1]!)).toBe(
+            1700000001
+        );
+        expect(countUnpushedFromReflog(content, tracking)).toBe(2);
+        expect(countUnpushedFromReflog(content, second)).toBe(0);
     });
 });

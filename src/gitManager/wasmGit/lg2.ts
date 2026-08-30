@@ -1,12 +1,13 @@
 import type { Lg2FS, Lg2Module } from "wasm-git/lg2_async.js";
 import initLg2 from "wasm-git/lg2_async.js";
 import wasmBinary from "wasm-git/lg2_async.wasm";
+import type { GitCpu } from "./gitCpu";
 import type { WasmGitHttpBridge } from "./httpBridge";
+import { containsLg2Error, isWasmTrap, type Lg2Result } from "./lg2Errors";
+import { applyMemDump, dumpMemRoots, LG2_DUMP_ROOTS } from "./memDump";
 
-export interface Lg2Result {
-    stdout: string;
-    stderr: string;
-}
+export type { Lg2Result } from "./lg2Errors";
+export { containsLg2Error, isWasmTrap } from "./lg2Errors";
 
 export class Lg2Error extends Error {
     constructor(
@@ -18,38 +19,6 @@ export class Lg2Error extends Error {
             `git ${args.join(" ")} failed: ${stderr.trim() || stdout.trim() || "unknown error"}`
         );
     }
-}
-
-/**
- * The lg2 examples signal failures through stderr instead of a usable exit
- * code (the Asyncify-wrapped `callMain` discards it), so failures are detected
- * by the well-known error formats of `lg2.c` and `common.h`:
- * - `Bad news:\n <message>` from the command dispatcher,
- * - `<message> [<errorcode>]...` from `check_lg2`/`fatal`,
- * - `USAGE:`/usage output for argument errors.
- *
- * Benign chatter is excluded: `show_ahead_behind` prints
- * `error: reference '...' not found` for branches without an upstream, and
- * checkout progress is purely informational.
- */
-const ERROR_PATTERNS = [
-    /^Bad news:/m,
-    /\s\[-?\d+\]( - |$)/m,
-    /^THROW: /m,
-    /^USAGE: /m,
-    /^usage: /m,
-    /^Unsupported option/m,
-    /^Unknown command line argument/m,
-    /^Command not found/m,
-    /^failed to /m,
-    /^Unable to /m,
-    /^invalid command/m,
-    /^command is not valid/m,
-    /^Unable to open repository/m,
-];
-
-export function containsLg2Error(stderr: string): boolean {
-    return ERROR_PATTERNS.some((pattern) => pattern.test(stderr));
 }
 
 /**
@@ -67,7 +36,10 @@ export class Lg2 {
     private stderr: string[] = [];
     private progressHandler: ((line: string) => void) | undefined;
 
-    constructor(private readonly httpBridge: WasmGitHttpBridge) {}
+    constructor(
+        private readonly httpBridge: WasmGitHttpBridge,
+        private readonly cpu?: GitCpu
+    ) {}
 
     get fs(): Lg2FS {
         if (!this.module) {
@@ -146,6 +118,25 @@ export class Lg2 {
             if (!this.module) {
                 throw new Error("wasm-git module is not initialized");
             }
+            if (this.cpu?.canRunLg2()) {
+                await this.cpu.ensureLg2();
+                const dump = dumpMemRoots(this.fs, LG2_DUMP_ROOTS);
+                const ran = await this.cpu.runLg2({
+                    cwd,
+                    args,
+                    dump,
+                    ignoreErrors: opts?.ignoreErrors,
+                });
+                applyMemDump(this.fs, LG2_DUMP_ROOTS, ran.dump);
+                const result = {
+                    stdout: ran.stdout,
+                    stderr: ran.stderr,
+                };
+                if (!opts?.ignoreErrors && containsLg2Error(result.stderr)) {
+                    throw new Lg2Error(args, result.stdout, result.stderr);
+                }
+                return result;
+            }
             this.stdout = [];
             this.stderr = [];
             this.progressHandler = opts?.onProgress;
@@ -197,25 +188,6 @@ export class Lg2 {
         this.module = undefined;
         this.queue = Promise.resolve();
     }
-}
-
-/** True when `callMain` died of a WebAssembly trap / abort, not a git error. */
-export function isWasmTrap(error: unknown): boolean {
-    if (
-        typeof WebAssembly !== "undefined" &&
-        error instanceof WebAssembly.RuntimeError
-    ) {
-        return true;
-    }
-    if (!(error instanceof Error)) return false;
-    if (error.name === "RuntimeError") return true;
-    return (
-        /memory access out of bounds/i.test(error.message) ||
-        /unreachable/i.test(error.message) ||
-        /table index is out of bounds/i.test(error.message) ||
-        /maximum call stack/i.test(error.message) ||
-        /^Aborted\(/i.test(error.message)
-    );
 }
 
 function getWasmBinaryCopy(): Uint8Array {

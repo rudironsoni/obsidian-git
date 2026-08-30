@@ -119,6 +119,29 @@ export async function writeTreeFromIndex(
     return writeTreeNode(root, writeObject);
 }
 
+/**
+ * Builds the commit trees in memory and returns every new object. The
+ * caller writes them to the vault. SHA-1 and zlib run in a worker.
+ */
+export async function writeTreeObjects(
+    entries: readonly GitIndexEntry[]
+): Promise<{
+    tree: string;
+    objects: { hash: string; compressed: Uint8Array }[];
+}> {
+    const objects: { hash: string; compressed: Uint8Array }[] = [];
+    const seen = new Set<string>();
+    const tree = await writeTreeFromIndex(entries, async (type, payload) => {
+        const stored = await gitObjectStore(type, payload);
+        if (!seen.has(stored.hash)) {
+            seen.add(stored.hash);
+            objects.push(stored);
+        }
+        return stored.hash;
+    });
+    return { tree, objects };
+}
+
 function insertIndexEntry(
     node: TreeNode,
     parts: string[],
@@ -158,28 +181,192 @@ export function parseGitConfigValue(
     content: string,
     dottedKey: string
 ): string | undefined {
-    const dot = dottedKey.indexOf(".");
-    if (dot <= 0) return undefined;
-    const sectionName = dottedKey.slice(0, dot).toLowerCase();
-    const keyName = dottedKey.slice(dot + 1).toLowerCase();
+    const parsedKey = splitGitConfigKey(dottedKey);
+    if (parsedKey == undefined) return undefined;
     let inSection = false;
     for (const raw of content.split("\n")) {
         const line = raw.trim();
         if (line === "" || line.startsWith("#") || line.startsWith(";")) {
             continue;
         }
-        const section = line.match(/^\[([^\]]+)\]$/);
+        const section = parseGitConfigSectionHeader(line);
         if (section) {
             inSection =
-                section[1]!.split(/\s/)[0]!.toLowerCase() === sectionName;
+                section.section === parsedKey.section &&
+                section.subsection === parsedKey.subsection;
             continue;
         }
         if (!inSection) continue;
         const kv = line.match(/^([^=]+)=(.*)$/);
         if (!kv) continue;
-        if (kv[1]!.trim().toLowerCase() === keyName) {
+        if (kv[1]!.trim().toLowerCase() === parsedKey.key) {
             return unwrapGitConfigValue(kv[2]!.trim());
         }
+    }
+    return undefined;
+}
+
+/** Subsection names under `[section "name"]`, e.g. remotes. */
+export function listGitConfigSubsections(
+    content: string,
+    sectionName: string
+): string[] {
+    const wanted = sectionName.toLowerCase();
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of content.split("\n")) {
+        const section = parseGitConfigSectionHeader(raw.trim());
+        if (!section || section.section !== wanted || !section.subsection) {
+            continue;
+        }
+        if (seen.has(section.subsection)) continue;
+        seen.add(section.subsection);
+        names.push(section.subsection);
+    }
+    return names;
+}
+
+function splitGitConfigKey(
+    dottedKey: string
+):
+    | { section: string; subsection: string | undefined; key: string }
+    | undefined {
+    const parts = dottedKey.split(".");
+    if (parts.length < 2) return undefined;
+    const section = parts[0]!.toLowerCase();
+    const key = parts[parts.length - 1]!.toLowerCase();
+    if (!section || !key) return undefined;
+    const subsection =
+        parts.length === 2 ? undefined : parts.slice(1, -1).join(".");
+    return { section, subsection, key };
+}
+
+function parseGitConfigSectionHeader(
+    line: string
+): { section: string; subsection: string | undefined } | undefined {
+    const quoted = line.match(/^\[([^\s\]]+)\s+"(.*)"\]$/);
+    if (quoted) {
+        return { section: quoted[1]!.toLowerCase(), subsection: quoted[2] };
+    }
+    const dotted = line.match(/^\[([^\s.\]]+)\.([^\]]+)\]$/);
+    if (dotted) {
+        return { section: dotted[1]!.toLowerCase(), subsection: dotted[2] };
+    }
+    const plain = line.match(/^\[([^\s\]]+)\]$/);
+    if (plain) {
+        return { section: plain[1]!.toLowerCase(), subsection: undefined };
+    }
+    return undefined;
+}
+
+export function upsertGitConfigValue(
+    content: string,
+    dottedKey: string,
+    value: string
+): string {
+    const parsedKey = splitGitConfigKey(dottedKey);
+    if (parsedKey == undefined) return content;
+    const lines = content.split("\n");
+    let inSection = false;
+    let sectionIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!.trim();
+        const section = parseGitConfigSectionHeader(line);
+        if (section) {
+            inSection =
+                section.section === parsedKey.section &&
+                section.subsection === parsedKey.subsection;
+            if (inSection) sectionIndex = i;
+            continue;
+        }
+        if (!inSection) continue;
+        const kv = line.match(/^([^=]+)=(.*)$/);
+        if (!kv) continue;
+        if (kv[1]!.trim().toLowerCase() !== parsedKey.key) continue;
+        const indent = lines[i]!.match(/^\s*/)?.[0] ?? "\t";
+        lines[i] = `${indent}${kv[1]!.trim()} = ${value}`;
+        return joinGitConfigLines(lines);
+    }
+    const assignment = `\t${parsedKey.key} = ${value}`;
+    if (sectionIndex >= 0) {
+        lines.splice(sectionIndex + 1, 0, assignment);
+        return joinGitConfigLines(lines);
+    }
+    const header = parsedKey.subsection
+        ? `[${parsedKey.section} "${parsedKey.subsection}"]`
+        : `[${parsedKey.section}]`;
+    const suffix = content.trim().length === 0 ? [] : [""];
+    const trimmed =
+        lines.length > 0 && lines[lines.length - 1] === ""
+            ? lines.slice(0, -1)
+            : lines;
+    return joinGitConfigLines([...trimmed, ...suffix, header, assignment, ""]);
+}
+
+export function removeGitConfigSection(
+    content: string,
+    sectionName: string,
+    subsection?: string
+): string {
+    const wanted = sectionName.toLowerCase();
+    const lines = content.split("\n");
+    const kept: string[] = [];
+    let skipping = false;
+    for (const raw of lines) {
+        const section = parseGitConfigSectionHeader(raw.trim());
+        if (section) {
+            skipping =
+                section.section === wanted && section.subsection === subsection;
+            if (skipping) continue;
+        }
+        if (skipping) continue;
+        kept.push(raw);
+    }
+    return joinGitConfigLines(kept);
+}
+
+function joinGitConfigLines(lines: string[]): string {
+    let text = lines.join("\n");
+    if (!text.endsWith("\n")) text += "\n";
+    return text.replace(/\n{3,}/g, "\n\n");
+}
+
+export function parsePackedRefs(content: string): Map<string, string> {
+    const refs = new Map<string, string>();
+    for (const line of content.split("\n")) {
+        if (line.startsWith("#") || line.startsWith("^")) continue;
+        const match = line.match(/^([0-9a-f]{40})\s+(\S+)$/i);
+        if (!match) continue;
+        refs.set(match[2]!, match[1]!.toLowerCase());
+    }
+    return refs;
+}
+
+/** Unix seconds from a reflog line, or undefined if the line is not a reflog. */
+export function parseReflogUnixSeconds(line: string): number | undefined {
+    const match = line.match(
+        /^[0-9a-f]{40} [0-9a-f]{40} .* (\d+) [+-]\d{4}\t/i
+    );
+    if (!match) return undefined;
+    const epoch = Number.parseInt(match[1]!, 10);
+    return Number.isFinite(epoch) ? epoch : undefined;
+}
+
+export function countUnpushedFromReflog(
+    content: string,
+    trackingHash: string
+): number | undefined {
+    const wanted = trackingHash.toLowerCase();
+    const lines = content.split("\n").filter((line) => line.length > 0);
+    let count = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const match = lines[i]!.match(/^([0-9a-f]{40}) ([0-9a-f]{40}) /i);
+        if (!match) continue;
+        const oldHash = match[1]!.toLowerCase();
+        const newHash = match[2]!.toLowerCase();
+        if (newHash === wanted) return count;
+        count += 1;
+        if (oldHash === wanted) return count;
     }
     return undefined;
 }
