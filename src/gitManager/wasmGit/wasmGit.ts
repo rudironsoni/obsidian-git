@@ -67,7 +67,17 @@ import {
 } from "./parsers";
 import type { MirrorAdapter } from "./vaultMirror";
 import { VaultMirror } from "./vaultMirror";
-import { isGitObjectPayloadPath } from "./gitObjectPayload";
+import { isGitDirSkippedOnSyncIn } from "./gitObjectPayload";
+import {
+    countIndexDiff,
+    gitObjectStore,
+    gitTimezoneOffset,
+    looseObjectVaultPath,
+    parseGitConfigValue,
+    serializeGitCommit,
+    writeTreeFromIndex,
+    type GitSignature,
+} from "./gitWrite";
 import {
     collapseUntrackedDirectories,
     collectUntracked,
@@ -178,7 +188,7 @@ export class WasmGit extends GitManager {
             gitDirVaultPath,
             MEM_GITDIR,
             () => false,
-            isGitObjectPayloadPath
+            isGitDirSkippedOnSyncIn
         );
         this.gitDirLoaded = false;
         this.gitOdbLoaded = false;
@@ -791,9 +801,13 @@ export class WasmGit extends GitManager {
             unique.push(repoPath);
         }
         if (unique.length === 0) return;
-        await this.ensureReady();
+        if (!this.useVaultGit()) {
+            await this.ensureReady();
+        }
         const lfsRules = await this.readLfsAttributeRules();
-        let entries = this.readIndexEntries();
+        let entries = this.useVaultGit()
+            ? await this.readIndexEntriesFromVault()
+            : this.readIndexEntries();
         const ops = await runPool(unique, BLOB_WRITE_CONCURRENCY, (repoPath) =>
             this.stagePathOp(repoPath, lfsRules)
         );
@@ -861,7 +875,9 @@ export class WasmGit extends GitManager {
             );
             blobData = new TextEncoder().encode(pointerText);
         }
-        const hash = await writeGitLooseBlob(this.lg2.fs, MEM_GITDIR, blobData);
+        const hash = this.useVaultGit()
+            ? await this.writeLooseObject("blob", blobData)
+            : await writeGitLooseBlob(this.lg2.fs, MEM_GITDIR, blobData);
         return {
             kind: "upsert",
             entry: {
@@ -898,10 +914,14 @@ export class WasmGit extends GitManager {
      * pointing at blobs that were never flushed.
      */
     private async persistIndex(entries: GitIndexEntry[]): Promise<void> {
+        const data = await writeGitIndex(entries);
+        if (this.useVaultGit()) {
+            await this.writeIndexToVault(data);
+            return;
+        }
         await this.gitDirMirror!.syncOut();
         const indexPath = `${MEM_GITDIR}/index`;
         const lockPath = `${MEM_GITDIR}/index.lock`;
-        const data = await writeGitIndex(entries);
         try {
             this.lg2.fs.writeFile(lockPath, data);
             if (this.lg2.fs.analyzePath(indexPath).exists) {
@@ -915,6 +935,24 @@ export class WasmGit extends GitManager {
             throw error;
         }
         await this.gitDirMirror!.syncOut();
+    }
+
+    private async writeIndexToVault(data: Uint8Array): Promise<void> {
+        const gitDir = this.getGitDirVaultPath();
+        const indexPath = normalizePath(`${gitDir}/index`);
+        const lockPath = normalizePath(`${gitDir}/index.lock`);
+        await this.adapter.writeBinary(lockPath, toArrayBuffer(data));
+        try {
+            await this.adapter.writeBinary(indexPath, toArrayBuffer(data));
+        } finally {
+            if (await this.adapter.exists(lockPath)) {
+                await this.adapter.remove(lockPath);
+            }
+        }
+    }
+
+    private useVaultGit(): boolean {
+        return Platform.isMobileApp;
     }
 
     /**
@@ -1161,40 +1199,158 @@ export class WasmGit extends GitManager {
                 await this.checkAuthorInfo();
                 const formattedMessage =
                     await this.formatCommitMessage(message);
-                const status = await this.status();
-                const mergeInProgress = this.lg2.fs.analyzePath(
-                    `${MEM_GITDIR}/MERGE_HEAD`
-                ).exists;
-                if (status.staged.length === 0 && !mergeInProgress && !amend) {
-                    // lg2's commit would happily create an empty commit.
-                    return 0;
+                const mergeHead = normalizePath(
+                    `${this.getGitDirVaultPath()}/MERGE_HEAD`
+                );
+                const mergeInProgress = await this.adapter.exists(mergeHead);
+                if (this.useVaultGit() && !amend && !mergeInProgress) {
+                    return await this.commitToVault(formattedMessage);
                 }
-                if (amend) {
-                    const parentExists = await this.readGitDir(
-                        ["rev-parse", "HEAD~1"],
-                        { ignoreErrors: true }
-                    );
-                    if (!/^[0-9a-f]{40}$/m.test(parentExists.stdout)) {
-                        throw new Error(
-                            "Amending the initial commit is not supported with the wasm-git engine."
-                        );
-                    }
-                    await this.mutate(["reset", "--soft", "HEAD~1"], {
-                        worktree: "none",
-                    });
-                }
-                await this.mutate(["commit", "-m", formattedMessage], {
-                    worktree: "none",
-                });
-                if (mergeInProgress) {
-                    this.plugin.localStorage.setConflict(false);
-                }
-                return status.staged.length;
+                return await this.commitWithLg2(
+                    formattedMessage,
+                    amend === true
+                );
             } catch (error) {
                 this.reportError(error);
                 throw error;
             }
         });
+    }
+
+    private async commitWithLg2(
+        formattedMessage: string,
+        amend: boolean
+    ): Promise<number | undefined> {
+        const status = await this.status();
+        if (status.staged.length === 0 && !amend) {
+            return 0;
+        }
+        if (amend) {
+            const parentExists = await this.readGitDir(
+                ["rev-parse", "HEAD~1"],
+                { ignoreErrors: true }
+            );
+            if (!/^[0-9a-f]{40}$/m.test(parentExists.stdout)) {
+                throw new Error(
+                    "Amending the initial commit is not supported with the wasm-git engine."
+                );
+            }
+            await this.mutate(["reset", "--soft", "HEAD~1"], {
+                worktree: "none",
+            });
+        }
+        await this.mutate(["commit", "-m", formattedMessage], {
+            worktree: "none",
+        });
+        this.plugin.localStorage.setConflict(false);
+        return status.staged.length;
+    }
+
+    /**
+     * Writes a commit from the vault index without starting wasm.
+     * iOS jetsams if `commit` copies `.git` into MEMFS.
+     */
+    private async commitToVault(
+        formattedMessage: string
+    ): Promise<number | undefined> {
+        this.plugin.crashLog?.log("commit-vault-start");
+        if (Platform.isMobileApp) {
+            new Notice("Git: committing…", 8000);
+        }
+        const entries = await this.readIndexEntriesFromVault();
+        const index = new Map(
+            entries
+                .filter((entry) => entry.stage === 0)
+                .map((entry) => [entry.path, entry])
+        );
+        const parent = await this.resolveHeadCommitHash();
+        const headBlobs = await this.readHeadBlobMap();
+        const changed = countIndexDiff(index, headBlobs);
+        const tree = await writeTreeFromIndex(entries, (type, payload) =>
+            this.writeLooseObject(type, payload)
+        );
+        this.plugin.crashLog?.log("commit-vault-tree", { tree, changed });
+        if (parent != undefined && changed === 0) {
+            const parentCommit = await this.readLooseObject(parent);
+            if (parentCommit?.type === "commit") {
+                const parsed = parseCommitObject(
+                    new TextDecoder("utf-8").decode(parentCommit.payload)
+                );
+                if (parsed?.tree === tree) {
+                    this.plugin.crashLog?.log("commit-vault-empty");
+                    return 0;
+                }
+            }
+        }
+        const author = await this.readAuthorSignature();
+        const payload = serializeGitCommit({
+            tree,
+            parents: parent == undefined ? [] : [parent],
+            author,
+            committer: author,
+            message: formattedMessage,
+        });
+        const hash = await this.writeLooseObject("commit", payload);
+        await this.updateBranchRef(hash);
+        this.plugin.crashLog?.log("commit-vault-done", { hash });
+        this.app.workspace.trigger("obsidian-git:head-change");
+        return changed;
+    }
+
+    private async readAuthorSignature(): Promise<GitSignature> {
+        const name = await this.getConfig("user.name");
+        const email = await this.getConfig("user.email");
+        if (!name || !email) {
+            throw Error(
+                "Git author name and email are not set. Please set both fields in the settings."
+            );
+        }
+        return {
+            name,
+            email,
+            epochSeconds: Math.floor(Date.now() / 1000),
+            tz: gitTimezoneOffset(),
+        };
+    }
+
+    private async writeLooseObject(
+        type: string,
+        payload: Uint8Array
+    ): Promise<string> {
+        const { hash, compressed } = await gitObjectStore(type, payload);
+        const vaultPath = normalizePath(
+            looseObjectVaultPath(this.getGitDirVaultPath(), hash)
+        );
+        if (!(await this.adapter.exists(vaultPath))) {
+            await this.ensureVaultDir(parentOfVault(vaultPath));
+            await this.adapter.writeBinary(
+                vaultPath,
+                toArrayBuffer(compressed)
+            );
+        }
+        return hash;
+    }
+
+    private async ensureVaultDir(path: string): Promise<void> {
+        if (path === "" || (await this.adapter.exists(path))) return;
+        await this.ensureVaultDir(parentOfVault(path));
+        await this.adapter.mkdir(path);
+    }
+
+    private async updateBranchRef(commitHash: string): Promise<void> {
+        const gitDir = this.getGitDirVaultPath();
+        const headPath = normalizePath(`${gitDir}/HEAD`);
+        const head = (await this.readVaultText(headPath)).trim();
+        const ref = head.match(/^ref:\s+(.*)$/)?.[1];
+        const body = `${commitHash}\n`;
+        const bytes = new TextEncoder().encode(body);
+        if (ref) {
+            const refPath = normalizePath(`${gitDir}/${ref}`);
+            await this.ensureVaultDir(parentOfVault(refPath));
+            await this.adapter.writeBinary(refPath, toArrayBuffer(bytes));
+            return;
+        }
+        await this.adapter.writeBinary(headPath, toArrayBuffer(bytes));
     }
 
     private async checkAuthorInfo(): Promise<void> {
@@ -1835,6 +1991,10 @@ export class WasmGit extends GitManager {
     }
 
     async getConfig(path: string): Promise<string | undefined> {
+        const fromVault = await this.readConfigFromVault(path);
+        if (fromVault != undefined || !this.lg2.initialized) {
+            return fromVault;
+        }
         await this.ensureReady();
         const result = await this.lg2.run(MEM_ROOT, ["config", path], {
             ignoreErrors: true,
@@ -1844,6 +2004,17 @@ export class WasmGit extends GitManager {
             return undefined;
         }
         return value;
+    }
+
+    private async readConfigFromVault(
+        dottedKey: string
+    ): Promise<string | undefined> {
+        const configPath = normalizePath(`${this.getGitDirVaultPath()}/config`);
+        if (!(await this.adapter.exists(configPath))) return undefined;
+        return parseGitConfigValue(
+            await this.readVaultText(configPath),
+            dottedKey
+        );
     }
 
     async setRemote(name: string, url: string): Promise<void> {
@@ -2363,6 +2534,27 @@ export class WasmGit extends GitManager {
     }
 
     private async readLfsAttributeRules(): Promise<LfsAttributeRule[]> {
+        if (this.useVaultGit() || !this.lg2.initialized) {
+            const rules: LfsAttributeRule[] = [];
+            const vaultPath =
+                this.plugin.settings.basePath === ""
+                    ? ".gitattributes"
+                    : `${this.plugin.settings.basePath}/.gitattributes`;
+            if (await this.adapter.exists(vaultPath)) {
+                rules.push(
+                    ...parseGitAttributes(await this.readVaultText(vaultPath))
+                );
+            }
+            const infoPath = normalizePath(
+                `${this.getGitDirVaultPath()}/info/attributes`
+            );
+            if (await this.adapter.exists(infoPath)) {
+                rules.push(
+                    ...parseGitAttributes(await this.readVaultText(infoPath))
+                );
+            }
+            return rules;
+        }
         await this.ensureReady();
         const rules: LfsAttributeRule[] = [];
         const memAttributes = `${MEM_ROOT}/.gitattributes`;
@@ -2378,10 +2570,9 @@ export class WasmGit extends GitManager {
                     ? ".gitattributes"
                     : `${this.plugin.settings.basePath}/.gitattributes`;
             if (await this.adapter.exists(vaultPath)) {
-                const content = new TextDecoder().decode(
-                    await this.adapter.readBinary(vaultPath)
+                rules.push(
+                    ...parseGitAttributes(await this.readVaultText(vaultPath))
                 );
-                rules.push(...parseGitAttributes(content));
             }
         }
         const infoAttributes = `${MEM_GITDIR}/info/attributes`;
@@ -2676,6 +2867,11 @@ type StageOp =
 function parentMemPath(path: string): string {
     const index = path.lastIndexOf("/");
     return index <= 0 ? "/" : path.substring(0, index);
+}
+
+function parentOfVault(path: string): string {
+    const index = path.lastIndexOf("/");
+    return index <= 0 ? "" : path.substring(0, index);
 }
 
 function uniquePointers(pointers: LfsPointer[]): LfsPointer[] {

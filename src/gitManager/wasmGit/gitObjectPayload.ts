@@ -9,3 +9,24 @@ export function isGitObjectPayloadPath(relativePath: string): boolean {
     const normalized = relativePath.replace(/\\/g, "/");
     return normalized === "objects" || normalized.startsWith("objects/");
 }
+
+/**
+ * Reflogs and hooks are not required to commit. Copying them on iOS
+ * jetsams the WebView during `gitDir-syncIn`.
+ */
+export function isGitDirHeavyMetadataPath(relativePath: string): boolean {
+    const normalized = relativePath.replace(/\\/g, "/");
+    return (
+        normalized === "logs" ||
+        normalized.startsWith("logs/") ||
+        normalized === "hooks" ||
+        normalized.startsWith("hooks/")
+    );
+}
+
+export function isGitDirSkippedOnSyncIn(relativePath: string): boolean {
+    return (
+        isGitObjectPayloadPath(relativePath) ||
+        isGitDirHeavyMetadataPath(relativePath)
+    );
+}

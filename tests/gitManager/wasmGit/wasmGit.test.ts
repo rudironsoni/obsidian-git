@@ -442,6 +442,30 @@ describe("WasmGit staging", () => {
 });
 
 describe("WasmGit.commit", () => {
+    it("commits without starting wasm", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        writeFileSync(path.join(vault.dir, "note.md"), "changed\n");
+        Platform.isMobileApp = true;
+        try {
+            await vault.manager.stage("note.md", true);
+            const changed = await vault.manager.commit({
+                message: "no wasm",
+            });
+            expect(changed).toBe(1);
+        } finally {
+            Platform.isMobileApp = false;
+        }
+        expect(
+            (await git(vault.dir, ["log", "-1", "--pretty=%s"])).trim()
+        ).toBe("no wasm");
+        const events = vault.plugin.crashLog.log.mock.calls.map((call) =>
+            String(call[0])
+        );
+        expect(events).toContain("commit-vault-done");
+        expect(events).not.toContain("lg2-init-start");
+    });
+
     it("commits staged changes only", async () => {
         const vault = createVault();
         await seedRepo(vault);
