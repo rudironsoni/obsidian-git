@@ -74,6 +74,8 @@ async function handleJob(job: GitWorkerJob): Promise<GitWorkerResult> {
     return handleGitWorkerRequest(request);
 }
 
+scope.postMessage({ kind: "ready" });
+
 function requestHttpFromHost(request: GitHttpRequest): Promise<Uint8Array> {
     const id = nextHttpId;
     nextHttpId += 1;

@@ -146,6 +146,9 @@ export class WasmGit extends GitManager {
             return "Basic " + btoa(`${username}:${password}`);
         };
         this.cpu.getAuthHeader = () => this.httpBridge.getAuthHeader();
+        this.cpu.onEvent = (event, data) => {
+            this.plugin.crashLog?.log(event, data);
+        };
     }
 
     // ------------------------------------------------------------------
@@ -878,6 +881,13 @@ export class WasmGit extends GitManager {
             unique.push(repoPath);
         }
         if (unique.length === 0) return;
+        this.plugin.crashLog?.log("stage-start", {
+            files: unique.length,
+            vault: this.useVaultGit(),
+        });
+        if (Platform.isMobileApp) {
+            new Notice(`Git: staging ${unique.length} files…`, 8000);
+        }
         if (!this.useVaultGit()) {
             await this.ensureReady();
         }
@@ -885,7 +895,8 @@ export class WasmGit extends GitManager {
         let entries = this.useVaultGit()
             ? await this.readIndexEntriesFromVault()
             : this.readIndexEntries();
-        const ops = await runPool(unique, BLOB_WRITE_CONCURRENCY, (repoPath) =>
+        const concurrency = Platform.isMobileApp ? 2 : BLOB_WRITE_CONCURRENCY;
+        const ops = await runPool(unique, concurrency, (repoPath) =>
             this.stagePathOp(repoPath, lfsRules)
         );
         for (const op of ops) {
@@ -906,7 +917,9 @@ export class WasmGit extends GitManager {
                 }
             }
         }
+        this.plugin.crashLog?.log("stage-index");
         await this.persistIndex(entries);
+        this.plugin.crashLog?.log("stage-done", { files: unique.length });
     }
 
     /** Stages paths from the in-memory worktree (used during rebase replay). */

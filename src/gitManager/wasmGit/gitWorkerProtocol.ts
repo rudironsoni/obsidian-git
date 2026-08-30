@@ -66,3 +66,5 @@ export type GitWorkerHttpRequestMsg = {
 export type GitWorkerHttpResponseMsg =
     | { kind: "httpResponse"; id: number; ok: true; body: ArrayBuffer }
     | { kind: "httpResponse"; id: number; ok: false; error: string };
+
+export type GitWorkerReadyMsg = { kind: "ready" };

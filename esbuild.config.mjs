@@ -7,48 +7,58 @@ import { sveltePreprocess } from "svelte-preprocess";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
+async function bundleWorker(entry, stubWasm) {
+    const result = await esbuild.build({
+        absWorkingDir: dirname,
+        entryPoints: [entry],
+        bundle: true,
+        write: false,
+        format: "iife",
+        platform: "browser",
+        target: "es2018",
+        logLevel: "silent",
+        external: [
+            "node:module",
+            "node:crypto",
+            "node:fs",
+            "node:url",
+            "node:path",
+            "ws",
+            "worker_threads",
+        ],
+        plugins: stubWasm
+            ? [
+                  {
+                      name: "stub-wasm-in-worker",
+                      setup(workerBuild) {
+                          workerBuild.onLoad({ filter: /\.wasm$/ }, () => ({
+                              contents: "export default new Uint8Array();",
+                              loader: "js",
+                          }));
+                      },
+                  },
+              ]
+            : [],
+    });
+    return result.outputFiles?.[0]?.text ?? "";
+}
+
 function gitWorkerSourcePlugin() {
     return {
         name: "git-worker-source",
         setup(build) {
             build.onLoad({ filter: /gitWorkerSource\.ts$/ }, async () => {
-                const result = await esbuild.build({
-                    absWorkingDir: dirname,
-                    entryPoints: ["src/gitManager/wasmGit/gitWorker.ts"],
-                    bundle: true,
-                    write: false,
-                    format: "iife",
-                    platform: "browser",
-                    target: "es2018",
-                    logLevel: "silent",
-                    external: [
-                        "node:module",
-                        "node:crypto",
-                        "node:fs",
-                        "node:url",
-                        "node:path",
-                        "ws",
-                        "worker_threads",
-                    ],
-                    plugins: [
-                        {
-                            name: "stub-wasm-in-worker",
-                            setup(workerBuild) {
-                                workerBuild.onLoad(
-                                    { filter: /\.wasm$/ },
-                                    () => ({
-                                        contents:
-                                            "export default new Uint8Array();",
-                                        loader: "js",
-                                    })
-                                );
-                            },
-                        },
-                    ],
-                });
-                const code = result.outputFiles?.[0]?.text ?? "";
+                const cpu = await bundleWorker(
+                    "src/gitManager/wasmGit/gitCpuWorker.ts",
+                    false
+                );
+                const lg2 = await bundleWorker(
+                    "src/gitManager/wasmGit/gitWorker.ts",
+                    true
+                );
                 return {
-                    contents: `export const GIT_WORKER_SOURCE = ${JSON.stringify(code)};`,
+                    contents: `export const GIT_CPU_WORKER_SOURCE = ${JSON.stringify(cpu)};
+export const GIT_LG2_WORKER_SOURCE = ${JSON.stringify(lg2)};`,
                     loader: "js",
                 };
             });

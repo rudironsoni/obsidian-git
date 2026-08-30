@@ -1,26 +1,45 @@
 import { handleGitWorkerRequest } from "./gitWorkerHandlers";
 import { sendGitHttpRequest } from "./httpBridge";
 import type {
+    GitCpuRequest,
     GitWorkerHttpRequestMsg,
     GitWorkerJob,
+    GitWorkerReadyMsg,
     GitWorkerReply,
     GitWorkerRequest,
     GitWorkerResult,
 } from "./gitWorkerProtocol";
-import { GIT_WORKER_SOURCE } from "./gitWorkerSource";
+import {
+    GIT_CPU_WORKER_SOURCE,
+    GIT_LG2_WORKER_SOURCE,
+} from "./gitWorkerSource";
 import type { GitIndexEntry } from "./gitIndex";
 import type { MemDump } from "./memDump";
 import wasmBinary from "wasm-git/lg2_async.wasm";
 
+const WORKER_READY_MS = 15_000;
+
+type WorkerEvent = GitWorkerReply | GitWorkerHttpRequestMsg | GitWorkerReadyMsg;
+
 /**
- * Runs CPU git work and `lg2` commands off the plugin thread when a
- * Worker is available. Vault I/O and `requestUrl` stay on the plugin thread.
+ * Runs CPU git work and `lg2` commands off the plugin thread.
+ * Staging uses a small CPU worker (no wasm-git glue). lg2 loads only
+ * for push/pull/clone. Blob URLs stay alive: iOS WebKit drops the
+ * worker if the URL is revoked in the same turn as `new Worker`.
  */
 export class GitCpu {
     getAuthHeader: () => string | undefined = () => undefined;
+    onEvent:
+        | ((event: string, data?: Record<string, unknown>) => void)
+        | undefined;
 
-    private worker: Worker | undefined;
-    private lg2Ready = false;
+    private cpuWorker: Worker | undefined;
+    private cpuWorkerUrl: string | undefined;
+    private cpuReady: Promise<Worker | undefined> | undefined;
+    private lg2Worker: Worker | undefined;
+    private lg2WorkerUrl: string | undefined;
+    private lg2ReadyPromise: Promise<Worker | undefined> | undefined;
+    private lg2ModuleReady = false;
     private nextId = 1;
     private readonly pending = new Map<
         number,
@@ -31,7 +50,7 @@ export class GitCpu {
     >();
 
     async hashGitBlob(content: Uint8Array): Promise<string> {
-        const result = await this.call({ op: "hashGitBlob", content });
+        const result = await this.callCpu({ op: "hashGitBlob", content });
         if (result.op !== "hashGitBlob") {
             throw new Error(`git worker returned ${result.op}`);
         }
@@ -42,7 +61,7 @@ export class GitCpu {
         type: string,
         payload: Uint8Array
     ): Promise<{ hash: string; compressed: Uint8Array }> {
-        const result = await this.call({
+        const result = await this.callCpu({
             op: "gitObjectStore",
             type,
             payload,
@@ -57,7 +76,7 @@ export class GitCpu {
         tree: string;
         objects: { hash: string; compressed: Uint8Array }[];
     }> {
-        const result = await this.call({
+        const result = await this.callCpu({
             op: "writeTreeFromIndex",
             entries,
         });
@@ -68,7 +87,7 @@ export class GitCpu {
     }
 
     async writeGitIndex(entries: GitIndexEntry[]): Promise<Uint8Array> {
-        const result = await this.call({ op: "writeGitIndex", entries });
+        const result = await this.callCpu({ op: "writeGitIndex", entries });
         if (result.op !== "writeGitIndex") {
             throw new Error(`git worker returned ${result.op}`);
         }
@@ -76,20 +95,22 @@ export class GitCpu {
     }
 
     canRunLg2(): boolean {
-        return Boolean(GIT_WORKER_SOURCE) && typeof Worker !== "undefined";
+        return Boolean(GIT_LG2_WORKER_SOURCE) && typeof Worker !== "undefined";
     }
 
     async ensureLg2(): Promise<boolean> {
         if (!this.canRunLg2()) return false;
-        if (this.lg2Ready) return true;
+        const worker = await this.getLg2Worker();
+        if (!worker) return false;
+        if (this.lg2ModuleReady) return true;
         const wasmBytes = new Uint8Array(wasmBinary);
         const wasm = new ArrayBuffer(wasmBytes.byteLength);
         new Uint8Array(wasm).set(wasmBytes);
-        const result = await this.call({ op: "lg2Init" }, [wasm], wasm);
+        const result = await this.post(worker, { op: "lg2Init" }, [wasm], wasm);
         if (result.op !== "lg2Init") {
             throw new Error(`git worker returned ${result.op}`);
         }
-        this.lg2Ready = true;
+        this.lg2ModuleReady = true;
         return true;
     }
 
@@ -99,7 +120,11 @@ export class GitCpu {
         dump: MemDump;
         ignoreErrors?: boolean;
     }): Promise<{ stdout: string; stderr: string; dump: MemDump }> {
-        const result = await this.call({
+        const worker = await this.getLg2Worker();
+        if (!worker) {
+            throw new Error("lg2 worker is not available");
+        }
+        const result = await this.post(worker, {
             op: "lg2Run",
             cwd: args.cwd,
             args: args.args,
@@ -117,28 +142,124 @@ export class GitCpu {
     }
 
     terminate(): void {
-        const worker = this.worker;
-        this.worker = undefined;
-        this.lg2Ready = false;
-        if (worker) worker.terminate();
+        this.dropCpuWorker();
+        this.dropLg2Worker();
         for (const { reject } of this.pending.values()) {
             reject(new Error("git worker stopped"));
         }
         this.pending.clear();
     }
 
-    private async call(
+    private async callCpu(request: GitCpuRequest): Promise<GitWorkerResult> {
+        const worker = await this.getCpuWorker();
+        if (!worker) {
+            return handleGitWorkerRequest(request);
+        }
+        return this.post(worker, request);
+    }
+
+    private async getCpuWorker(): Promise<Worker | undefined> {
+        if (!this.cpuReady) {
+            this.cpuReady = this.startWorker(
+                GIT_CPU_WORKER_SOURCE,
+                "cpu-worker"
+            ).then((started) => {
+                this.cpuWorker = started?.worker;
+                this.cpuWorkerUrl = started?.url;
+                return this.cpuWorker;
+            });
+        }
+        return this.cpuReady;
+    }
+
+    private async getLg2Worker(): Promise<Worker | undefined> {
+        if (!this.lg2ReadyPromise) {
+            this.lg2ReadyPromise = this.startWorker(
+                GIT_LG2_WORKER_SOURCE,
+                "lg2-worker"
+            ).then((started) => {
+                this.lg2Worker = started?.worker;
+                this.lg2WorkerUrl = started?.url;
+                return this.lg2Worker;
+            });
+        }
+        return this.lg2ReadyPromise;
+    }
+
+    private async startWorker(
+        source: string | undefined,
+        name: string
+    ): Promise<{ worker: Worker; url: string } | undefined> {
+        if (!source) return undefined;
+        if (typeof Worker === "undefined") return undefined;
+        this.onEvent?.("worker-start", { name, bytes: source.length });
+        const blob = new Blob([source], { type: "text/javascript" });
+        const url = URL.createObjectURL(blob);
+        const worker = new Worker(url);
+        try {
+            await this.waitUntilReady(worker, name);
+        } catch (error) {
+            worker.terminate();
+            URL.revokeObjectURL(url);
+            this.onEvent?.("worker-start-failed", {
+                name,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+        }
+        worker.addEventListener(
+            "message",
+            (event: MessageEvent<WorkerEvent>) => {
+                this.onMessage(event.data);
+            }
+        );
+        worker.addEventListener("error", (event) => {
+            this.onEvent?.("worker-error", {
+                name,
+                message: event.message,
+            });
+            if (name === "cpu-worker") this.dropCpuWorker();
+            else this.dropLg2Worker();
+        });
+        this.onEvent?.("worker-ready", { name });
+        return { worker, url };
+    }
+
+    private waitUntilReady(worker: Worker, name: string): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const timer = window.setTimeout(() => {
+                worker.removeEventListener("message", onMessage);
+                worker.removeEventListener("error", onError);
+                reject(
+                    new Error(
+                        `${name} did not become ready within ${WORKER_READY_MS}ms`
+                    )
+                );
+            }, WORKER_READY_MS);
+            const onMessage = (event: MessageEvent<WorkerEvent>) => {
+                if (event.data.kind !== "ready") return;
+                window.clearTimeout(timer);
+                worker.removeEventListener("message", onMessage);
+                worker.removeEventListener("error", onError);
+                resolve();
+            };
+            const onError = (event: ErrorEvent) => {
+                window.clearTimeout(timer);
+                worker.removeEventListener("message", onMessage);
+                worker.removeEventListener("error", onError);
+                reject(new Error(`${name} failed: ${event.message}`));
+            };
+            worker.addEventListener("message", onMessage);
+            worker.addEventListener("error", onError);
+        });
+    }
+
+    private post(
+        worker: Worker,
         request: GitWorkerRequest,
         transfer?: Transferable[],
         wasm?: ArrayBuffer
     ): Promise<GitWorkerResult> {
-        const worker = this.ensureWorker();
-        if (!worker) {
-            if (request.op === "lg2Init" || request.op === "lg2Run") {
-                throw new Error("lg2 worker is not available");
-            }
-            return handleGitWorkerRequest(request);
-        }
         const id = this.nextId;
         this.nextId += 1;
         const job: GitWorkerJob = { kind: "job", id, request, wasm };
@@ -152,44 +273,13 @@ export class GitCpu {
                 }
             } catch {
                 this.pending.delete(id);
-                this.dropWorker();
                 reject(new Error("git worker postMessage failed"));
             }
         });
     }
 
-    private ensureWorker(): Worker | undefined {
-        if (this.worker) return this.worker;
-        if (!GIT_WORKER_SOURCE) return undefined;
-        if (typeof Worker === "undefined") return undefined;
-        try {
-            const blob = new Blob([GIT_WORKER_SOURCE], {
-                type: "text/javascript",
-            });
-            const url = URL.createObjectURL(blob);
-            const worker = new Worker(url);
-            URL.revokeObjectURL(url);
-            worker.addEventListener(
-                "message",
-                (
-                    event: MessageEvent<
-                        GitWorkerReply | GitWorkerHttpRequestMsg
-                    >
-                ) => {
-                    this.onMessage(event.data);
-                }
-            );
-            worker.addEventListener("error", () => {
-                this.dropWorker();
-            });
-            this.worker = worker;
-            return worker;
-        } catch {
-            return undefined;
-        }
-    }
-
-    private onMessage(data: GitWorkerReply | GitWorkerHttpRequestMsg): void {
+    private onMessage(data: WorkerEvent): void {
+        if (data.kind === "ready") return;
         if (data.kind === "httpRequest") {
             void this.handleHttpRequest(data);
             return;
@@ -207,7 +297,7 @@ export class GitCpu {
     private async handleHttpRequest(
         message: GitWorkerHttpRequestMsg
     ): Promise<void> {
-        const worker = this.worker;
+        const worker = this.lg2Worker;
         if (!worker) return;
         try {
             const body = await sendGitHttpRequest(
@@ -235,14 +325,33 @@ export class GitCpu {
         }
     }
 
-    private dropWorker(): void {
-        const worker = this.worker;
-        this.worker = undefined;
-        this.lg2Ready = false;
+    private dropCpuWorker(): void {
+        const worker = this.cpuWorker;
+        const url = this.cpuWorkerUrl;
+        this.cpuWorker = undefined;
+        this.cpuWorkerUrl = undefined;
+        this.cpuReady = undefined;
         if (worker) worker.terminate();
+        if (url) URL.revokeObjectURL(url);
+        this.failPending("cpu worker failed");
+    }
+
+    private dropLg2Worker(): void {
+        const worker = this.lg2Worker;
+        const url = this.lg2WorkerUrl;
+        this.lg2Worker = undefined;
+        this.lg2WorkerUrl = undefined;
+        this.lg2ReadyPromise = undefined;
+        this.lg2ModuleReady = false;
+        if (worker) worker.terminate();
+        if (url) URL.revokeObjectURL(url);
+        this.failPending("lg2 worker failed");
+    }
+
+    private failPending(message: string): void {
         for (const [id, { reject }] of this.pending) {
             this.pending.delete(id);
-            reject(new Error("git worker failed"));
+            reject(new Error(message));
         }
     }
 }
