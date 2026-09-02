@@ -1,58 +1,19 @@
 import esbuild from "esbuild";
 import esbuildSvelte from "esbuild-svelte";
-import path from "path";
 import process from "process";
-import { fileURLToPath } from "url";
 import { sveltePreprocess } from "svelte-preprocess";
-
-const dirname = path.dirname(fileURLToPath(import.meta.url));
-
-async function bundleWorker(entry, stubWasm) {
-    const result = await esbuild.build({
-        absWorkingDir: dirname,
-        entryPoints: [entry],
-        bundle: true,
-        write: false,
-        format: "iife",
-        platform: "browser",
-        target: "es2018",
-        logLevel: "silent",
-        external: [
-            "node:module",
-            "node:crypto",
-            "node:fs",
-            "node:url",
-            "node:path",
-            "ws",
-            "worker_threads",
-        ],
-        plugins: stubWasm
-            ? [
-                  {
-                      name: "stub-wasm-in-worker",
-                      setup(workerBuild) {
-                          workerBuild.onLoad({ filter: /\.wasm$/ }, () => ({
-                              contents: "export default new Uint8Array();",
-                              loader: "js",
-                          }));
-                      },
-                  },
-              ]
-            : [],
-    });
-    return result.outputFiles?.[0]?.text ?? "";
-}
+import { bundleGitWorker, wasmGitWebOnlyPlugin } from "./esbuild.workers.mjs";
 
 function gitWorkerSourcePlugin() {
     return {
         name: "git-worker-source",
         setup(build) {
             build.onLoad({ filter: /gitWorkerSource\.ts$/ }, async () => {
-                const cpu = await bundleWorker(
+                const cpu = await bundleGitWorker(
                     "src/gitManager/wasmGit/gitCpuWorker.ts",
                     false
                 );
-                const lg2 = await bundleWorker(
+                const lg2 = await bundleGitWorker(
                     "src/gitManager/wasmGit/gitWorker.ts",
                     true
                 );
@@ -125,6 +86,7 @@ const context = await esbuild.context({
     minify: prod,
     conditions: [prod ? "production" : "development"], // https://www.npmjs.com/package/esm-env
     plugins: [
+        wasmGitWebOnlyPlugin(),
         gitWorkerSourcePlugin(),
         esbuildSvelte({
             compilerOptions: {
