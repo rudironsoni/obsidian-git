@@ -44,8 +44,13 @@ export async function writeGitLooseBlob(
     return hash;
 }
 
-export async function zlibInflate(data: Uint8Array): Promise<Uint8Array> {
-    const stream = new DecompressionStream("deflate");
+async function transformZlib(
+    data: Uint8Array,
+    stream: TransformStream<Uint8Array, Uint8Array>
+): Promise<Uint8Array> {
+    // Start the reader first. Writing the whole chunk before anyone
+    // consumes `readable` can stall on stream backpressure in Chrome.
+    const output = new Response(stream.readable).arrayBuffer();
     const writer = stream.writable.getWriter();
     try {
         await writer.write(data);
@@ -54,20 +59,15 @@ export async function zlibInflate(data: Uint8Array): Promise<Uint8Array> {
         writer.abort(error).catch(() => undefined);
         throw error;
     }
-    return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+    return new Uint8Array(await output);
+}
+
+export async function zlibInflate(data: Uint8Array): Promise<Uint8Array> {
+    return transformZlib(data, new DecompressionStream("deflate"));
 }
 
 export async function zlibDeflate(data: Uint8Array): Promise<Uint8Array> {
-    const stream = new CompressionStream("deflate");
-    const writer = stream.writable.getWriter();
-    try {
-        await writer.write(data);
-        await writer.close();
-    } catch (error) {
-        writer.abort(error).catch(() => undefined);
-        throw error;
-    }
-    return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+    return transformZlib(data, new CompressionStream("deflate"));
 }
 
 export function toHex(bytes: Uint8Array): string {

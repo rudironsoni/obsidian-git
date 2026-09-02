@@ -41,6 +41,12 @@ describe("zlib and git objects", () => {
         expect(await zlibInflate(await zlibDeflate(input))).toEqual(input);
     });
 
+    it("round-trips a payload larger than the stream queue", async () => {
+        const input = new Uint8Array(64 * 1024);
+        for (let i = 0; i < input.length; i++) input[i] = i % 251;
+        expect(await zlibInflate(await zlibDeflate(input))).toEqual(input);
+    });
+
     it("inflates a loose blob object", async () => {
         const store = gitBlobStore(new TextEncoder().encode("hi"));
         const inflated = await inflateGitObject(await zlibDeflate(store));

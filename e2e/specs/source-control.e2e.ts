@@ -44,22 +44,17 @@ describe("obsidian-git smoke", function () {
         const view = browser.$("main.git-view");
         await expect(view).toExist();
 
-        await browser.executeObsidian(async ({ app }, pluginId) => {
+        await browser.executeObsidian(async ({ app }) => {
             if (!(await app.vault.adapter.exists("Changed.md"))) {
                 await app.vault.create("Changed.md", "e2e change\n");
             }
-            const plugin = (
-                app as {
-                    plugins: {
-                        plugins: Record<
-                            string,
-                            { updateCachedStatus?: () => Promise<unknown> }
-                        >;
-                    };
-                }
-            ).plugins.plugins[pluginId];
-            await plugin?.updateCachedStatus?.();
-        }, PLUGIN_ID);
+        });
+
+        // Refresh from the view, not execute/sync. Awaiting status inside
+        // ChromeDriver execute/sync times out the renderer.
+        const refreshBtn = browser.$("main.git-view #refresh");
+        await expect(refreshBtn).toExist();
+        await refreshBtn.click();
 
         const changed = browser.$('.git-view [data-path="Changed.md"]');
         await expect(changed).toExist();

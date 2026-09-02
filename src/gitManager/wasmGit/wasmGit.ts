@@ -41,6 +41,7 @@ import {
     type GitIndexEntry,
 } from "./gitIndex";
 import {
+    hashGitBlob,
     inflateGitObject,
     parseGitTree,
     runPool,
@@ -775,7 +776,10 @@ export class WasmGit extends GitManager {
         const data = new Uint8Array(
             await this.adapter.readBinary(this.getRelativeVaultPath(repoPath))
         );
-        return this.cpu.hashGitBlob(data);
+        // Status runs on the plugin thread. A CPU worker here can stall
+        // ChromeDriver execute/sync: the renderer waits on the promise and
+        // never sees the worker's ready ping.
+        return hashGitBlob(data);
     }
 
     async getStagedFiles(
