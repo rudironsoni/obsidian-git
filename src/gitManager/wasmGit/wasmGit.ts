@@ -47,6 +47,7 @@ import {
     runPool,
     writeGitLooseBlob,
 } from "./gitObject";
+import { GitPackStore, listPackPairs } from "./gitPack";
 import type { ParsedCommitObject, ParsedNameStatusEntry } from "./parsers";
 import {
     applyUnifiedPatch,
@@ -125,6 +126,7 @@ export class WasmGit extends GitManager {
     private gitDirLoaded = false;
     /** True after pack/loose objects have been paged into MEMFS. */
     private gitOdbLoaded = false;
+    private readonly packStore = new GitPackStore();
     /**
      * In-flight {@link ensureReady}. Concurrent callers (Source Control
      * `status-changed` plus the status bar `refreshed` listener) must share
@@ -570,8 +572,8 @@ export class WasmGit extends GitManager {
     }
 
     /**
-     * Index vs HEAD using loose objects only. Packed HEAD trees return []
-     * rather than copying packs into MEMFS.
+     * Index vs HEAD using vault objects (loose, then pack). Does not start
+     * wasm or copy packs into MEMFS.
      */
     private async diffIndexToHead(
         index: Map<string, GitIndexEntry>
@@ -598,7 +600,7 @@ export class WasmGit extends GitManager {
     private async readHeadBlobMap(): Promise<Map<string, string> | undefined> {
         const commitHash = await this.resolveHeadCommitHash();
         if (commitHash == undefined) return undefined;
-        const commit = await this.readLooseObject(commitHash);
+        const commit = await this.readGitObject(commitHash);
         if (commit == undefined || commit.type !== "commit") {
             this.plugin.crashLog?.log("status-head-packed");
             return undefined;
@@ -701,7 +703,7 @@ export class WasmGit extends GitManager {
         while (current && current !== tracking) {
             if (seen.has(current)) return undefined;
             seen.add(current);
-            const object = await this.readLooseObject(current);
+            const object = await this.readGitObject(current);
             if (object == undefined || object.type !== "commit") {
                 return undefined;
             }
@@ -733,7 +735,7 @@ export class WasmGit extends GitManager {
         prefix: string,
         blobs: Map<string, string>
     ): Promise<boolean> {
-        const object = await this.readLooseObject(hash);
+        const object = await this.readGitObject(hash);
         if (object == undefined || object.type !== "tree") {
             this.plugin.crashLog?.log("status-head-packed");
             return false;
@@ -751,6 +753,14 @@ export class WasmGit extends GitManager {
         return true;
     }
 
+    private async readGitObject(
+        hash: string
+    ): Promise<{ type: string; payload: Uint8Array } | undefined> {
+        const loose = await this.readLooseObject(hash);
+        if (loose) return loose;
+        return this.readPackedObject(hash);
+    }
+
     private async readLooseObject(
         hash: string
     ): Promise<{ type: string; payload: Uint8Array } | undefined> {
@@ -765,6 +775,25 @@ export class WasmGit extends GitManager {
         } catch {
             return undefined;
         }
+    }
+
+    private async readPackedObject(
+        hash: string
+    ): Promise<{ type: string; payload: Uint8Array } | undefined> {
+        const packDir = normalizePath(
+            `${this.getGitDirVaultPath()}/objects/pack`
+        );
+        if (!(await this.adapter.exists(packDir))) return undefined;
+        const listing = await this.adapter.list(packDir);
+        const packs = listPackPairs(listing.files);
+        if (packs.length === 0) return undefined;
+        return this.packStore.get(hash, packs, (vaultPath) =>
+            this.readVaultBytes(vaultPath)
+        );
+    }
+
+    private async readVaultBytes(vaultPath: string): Promise<Uint8Array> {
+        return new Uint8Array(await this.adapter.readBinary(vaultPath));
     }
 
     private async readVaultText(vaultPath: string): Promise<string> {
@@ -1376,7 +1405,7 @@ export class WasmGit extends GitManager {
         }
         this.plugin.crashLog?.log("commit-vault-tree", { tree, changed });
         if (parent != undefined && changed === 0) {
-            const parentCommit = await this.readLooseObject(parent);
+            const parentCommit = await this.readGitObject(parent);
             if (parentCommit?.type === "commit") {
                 const parsed = parseCommitObject(
                     new TextDecoder("utf-8").decode(parentCommit.payload)
@@ -2352,7 +2381,7 @@ export class WasmGit extends GitManager {
     async getLastCommitTime(): Promise<Date | undefined> {
         const head = await this.resolveHeadCommitHash();
         if (!head) return undefined;
-        const object = await this.readLooseObject(head);
+        const object = await this.readGitObject(head);
         if (object?.type === "commit") {
             const parsed = parseCommitObject(
                 new TextDecoder("utf-8").decode(object.payload)
@@ -2988,6 +3017,7 @@ export class WasmGit extends GitManager {
         this.gitDirLoaded = false;
         this.gitOdbLoaded = false;
         this.ensureReadyPromise = undefined;
+        this.packStore.clear();
     }
 
     private reportError(error: unknown): void {

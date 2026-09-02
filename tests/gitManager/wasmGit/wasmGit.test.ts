@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Platform } from "obsidian";
@@ -201,6 +201,45 @@ describe("WasmGit.status", () => {
         ]);
         expect(status.staged.map((file) => file.path)).toEqual(["staged.md"]);
         expect(status.conflicted).toEqual([]);
+    });
+
+    it("reports staged files when HEAD objects are packed", async () => {
+        const vault = createVault();
+        await seedRepo(vault);
+        mkdirSync(path.join(vault.dir, "notes"));
+        writeFileSync(path.join(vault.dir, "notes/a.md"), "one\n");
+        await git(vault.dir, ["add", "notes/a.md"]);
+        await git(vault.dir, ["commit", "-m", "nested"]);
+        await git(vault.dir, ["repack", "-Ad"]);
+        await git(vault.dir, ["prune-packed"]);
+        const head = await git(vault.dir, ["rev-parse", "HEAD"]);
+        expect(
+            existsSync(
+                path.join(
+                    vault.dir,
+                    ".git",
+                    "objects",
+                    head.slice(0, 2),
+                    head.slice(2)
+                )
+            )
+        ).toBe(false);
+
+        writeFileSync(path.join(vault.dir, "notes/a.md"), "two\n");
+        await git(vault.dir, ["add", "notes/a.md"]);
+
+        const status = await vault.manager.status();
+
+        expect(status.staged.map((file) => file.path)).toEqual(["notes/a.md"]);
+        expect(status.changed).toEqual([]);
+
+        const changed = await vault.manager.commit({
+            message: "packed head",
+        });
+        expect(changed).toBe(1);
+        expect(
+            (await git(vault.dir, ["log", "-1", "--pretty=%s"])).trim()
+        ).toBe("packed head");
     });
 
     it("lists files individually inside untracked directories", async () => {
